@@ -1,0 +1,8 @@
+# Die fertige ZIP gibt es nur als Release, nicht im Repository
+*.zip
+
+# Build-Ausgabe
+source/Bin/
+source/PDB/
+source/G1 MD Release/
+source/.vs/

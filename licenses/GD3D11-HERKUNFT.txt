@@ -1,0 +1,21 @@
+Renderer system\GD3D11\Bin\g1_avx2.dll – geänderte Fassung von GD3D11 („coop6“)
+==================================================================================
+
+Original
+  GD3D11, https://github.com/Kirides/GD3D11
+  Tag v17.9.7, Commit c83a4245d6d5bc249af0c6a4a91d44b127e12c82 (11.02.2026)
+  Lizenz: GNU General Public License, Version 3 (GPL-3.0) – Text in GD3D11-GPL-3.0.txt
+
+Geänderte Fassung „v17.9.7-c83a424-coop6“ (19./20.10.2026, für GothicCoop)
+  - Zuschau-Fenster: zweites Bild aus der Sicht des Mitspielers (Export GDX_CoopSecondView)
+  - Figur-Vorschau im COOP-Menü (Exporte GDX_CoopPreviewDraw, GDX_CoopPreviewRelease, GDX_CoopPreviewVersion)
+  - Schatten im Zweitbild, Absturz bei fehlendem Material, Übersetzungsfehler in CalculateCascadeMatrices umgangen
+  Die Änderungen stehen unter derselben Lizenz (GPL-3.0). Es gibt keinerlei Gewährleistung
+  (GPL-3.0, Abschnitte 15 und 16).
+
+Quelltext
+  Vollständiger Stand der Änderungen gegen v17.9.7: GD3D11-coop6.patch (liegt bei).
+  Bau: git clone --depth 1 --branch v17.9.7 https://github.com/Kirides/GD3D11.git
+       git apply GD3D11-coop6.patch
+       msbuild D3D11Engine\D3D11Engine.vcxproj /t:Rebuild /p:Configuration=Release_G1_AVX2 /p:Platform=Win32
+         /p:PlatformToolset=v142   (Visual Studio 2019 Build Tools; NuGet-Pakete wie im Original)

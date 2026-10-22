@@ -1,0 +1,29 @@
+GothicCoop für Othello – geänderte Fassung von Gothic Together (GothicCoop)
+============================================================================
+
+Diese Datei gehört zu system\Autorun\Gothic1Coop.dll, COOP_MENU.D und PC_MULTIPLAYER_HERO.D.
+
+Original
+  Gothic Together / GothicCoop, https://gitlab.com/gothiccoop/gothiccoop (Branch master)
+  Lizenz: GNU Affero General Public License, Version 3 (AGPL-3.0) – Text in GothicCoop-AGPL-3.0.txt
+
+Geänderte Fassung
+  Seit 16.10.2026 geändert: Anpassung an Othello 4.4.2.1, Abgleich von Welt, Dialogen, Tagebuch und
+  Spielständen, COOP-Menü, Zuschau-Kamera, Schwierigkeitsgrad, Kampf-Übergabe u. a. Die Fassung steht in
+  der Versionszeile im Hauptmenü („GothicCoop vNN“) und im Namen der ZIP.
+  Die Änderungen stehen unter derselben Lizenz (AGPL-3.0). Es gibt keinerlei Gewährleistung
+  (AGPL-3.0, Abschnitte 15 und 16).
+
+Quelltext
+  Zu jeder Fassung gehört der vollständige Quelltext (Git-Tag vNN). Wer diese Dateien weitergibt, muss
+  den Quelltext mitgeben oder zugänglich machen. Wer über das Netzwerk mit einer laufenden Fassung
+  spielt, hat ebenfalls Anspruch darauf (AGPL-3.0, Abschnitt 13) – frag den, von dem du die ZIP hast.
+
+Enthaltene Fremdbibliotheken (in Gothic1Coop.dll)
+  ENet 1.3.17               – MIT-Lizenz, ENet-LICENSE.txt
+  nlohmann/json             – MIT-Lizenz, nlohmann-json-LICENSE.MIT.txt
+
+Renderer
+  system\GD3D11\Bin\g1_avx2.dll ist eine geänderte Fassung von GD3D11 – siehe GD3D11-HERKUNFT.txt.
+
+Gothic- und Othello-Spieldateien sind nicht enthalten; sie gehören ihren Rechteinhabern.

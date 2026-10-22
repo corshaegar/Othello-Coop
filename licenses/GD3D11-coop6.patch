@@ -1,0 +1,709 @@
+diff --git a/D3D11Engine/D3D11GraphicsEngine.cpp b/D3D11Engine/D3D11GraphicsEngine.cpp
+index c5c383d..52a3f2e 100644
+--- a/D3D11Engine/D3D11GraphicsEngine.cpp
++++ b/D3D11Engine/D3D11GraphicsEngine.cpp
+@@ -47,6 +47,11 @@
+ #include "ImGuiShim.h"
+ #include "zCModel.h"
+ #include "zCOption.h"
++#include "WorldConverter.h"   // GothicCoop coop6: Figur-Vorschau (ExtractNodeVisual)
++#include "zCMorphMesh.h"
++#include "zCProgMeshProto.h"
++#include "zCVisual.h"
++#include "zCVob.h"
+ 
+ #ifdef BUILD_SPACER
+ #define IS_SPACER_BUILD true
+@@ -2908,6 +2913,9 @@ XRESULT D3D11GraphicsEngine::OnStartWorldRendering() {
+             }
+         }
+ 
++        // GothicCoop: Zweitbild oben rechts (nur wenn GothicCoop es ueber GDX_CoopSecondView eingeschaltet hat)
++        RenderCoopSecondView();
++
+         // Below this, we assume UI/HUD rendering
+         Engine::GAPI->GetRendererState().RendererInfo.IsRenderingWorld = false;
+ 
+@@ -2944,6 +2952,438 @@ XRESULT D3D11GraphicsEngine::OnStartWorldRendering() {
+     return XR_SUCCESS;
+ }
+ 
++// --- GothicCoop: Zweitbild (Fenster oben rechts) aus einer zweiten Kamera ------------------------------------------------
++// Othello-Coop (GothicCoop), 19.10.2026 - Beschreibung und Anleitung fuer neue GD3D11-Fassungen: GD3D11-UMBAU.md im Coop-Projekt.
++// Nach dem Hauptbild (HDR -> Backbuffer kopiert) wird die Szene ein zweites Mal gezeichnet: das Kamera-Objekt der Sitzung kurz
++// auf die zweite Kamera setzen (zCCamera::Activate liest dessen trafoObjToWorld +0x3C - Sicht und Sichtkegel folgen, damit
++// auch jede Aussortierung in GD3D11 ueber zCCamera::GetCamera()->BBox3DInFrustum), G-Buffer/HDR/Tiefe leeren (nicht Clear():
++// das leert auch den Backbuffer), Himmel + DrawWorldMeshNaive (Weltnetz, Modelle, Vobs, Licht, Sonnenschatten) + Geister, ohne
++// Punktlicht-Schatten, HBAO, Partikel und Occlusion-Culling, Kamera zurueck, HDR-Bild verkleinert in ein Zwischenbild, das mit
++// Rahmen in den Backbuffer. Das Zwischenbild bleibt - neu gezeichnet wird nur jedes n-te Bild.
++// Sonnenschatten (coop4): eigene D3D11ShadowMap fuers Zweitbild (ShadowMaps wird fuer den Durchgang getauscht), Kaskaden um die
++// Zweitkamera aus den Vobs des Zweitbilds; D3D11ShadowMap::DrawLighting fuehrt seinen bilduebergreifenden Zustand dafuer getrennt
++// (g_CoopSecondViewPass). Test coop1: geteilter Zustand verstellte die Schatten des Hauptbilds; coop2/coop3 lasen die Kaskaden
++// des Hauptbilds - die decken nur dessen Sicht.
++bool g_CoopSecondViewPass = false;
++
++// coop4: Groesse der Schattenkarten des Zweitbilds (je Kaskade) - das Fenster ist klein, 1024 reicht und spart Fuellrate
++static constexpr int COOP_SECOND_VIEW_SHADOWMAP_SIZE = 1024;
++
++namespace {
++    struct CoopSecondViewState {
++        bool enabled = false;
++        XMFLOAT4X4 camToWorld = {};
++        float x = 0.70f, y = 0.03f, w = 0.27f;   // Fenster in Bildanteilen (Hoehe folgt dem Seitenverhaeltnis)
++        int everyNth = 2;
++        unsigned int frame = 0;
++        bool texValid = false;
++        std::unique_ptr<RenderToTextureBuffer> tex;
++        INT2 texSize = INT2( 0, 0 );
++        std::unique_ptr<D3D11ShadowMap> shadow;              // coop4: Schattenkarten des Zweitbilds
++        std::unique_ptr<RenderToTextureBuffer> depthSave;    // coop4: Tiefen-Kopie des Hauptbilds waehrend des Durchgangs
++        INT2 depthSaveSize = INT2( 0, 0 );
++    };
++    CoopSecondViewState g_CoopSV;
++}
++
++void D3D11GraphicsEngine_CoopSecondViewSet( int enabled, const float* camToWorld, float x, float y, float w, int everyNth ) {
++    g_CoopSV.enabled = enabled != 0 && camToWorld != nullptr;
++    if ( !g_CoopSV.enabled ) {
++        g_CoopSV.texValid = false;
++        return;
++    }
++    memcpy( &g_CoopSV.camToWorld, camToWorld, sizeof( XMFLOAT4X4 ) );
++    g_CoopSV.x = std::clamp( x, 0.0f, 0.95f );
++    g_CoopSV.y = std::clamp( y, 0.0f, 0.95f );
++    g_CoopSV.w = std::clamp( w, 0.05f, 1.0f );
++    g_CoopSV.everyNth = std::max( 1, everyNth );
++}
++
++void D3D11GraphicsEngine::RenderCoopSecondView() {
++    if ( !g_CoopSV.enabled )
++        return;
++    zCCamera* cam = zCCamera::GetCamera();
++    oCGame* game = oCGame::GetGame();
++    if ( !cam || !game || !game->_zCSession_camVob || !Engine::GAPI->GetLoadedWorldInfo() )
++        return;
++    const INT2 res = GetResolution();
++    const INT2 bb = GetBackbufferResolution();
++    if ( res.x <= 0 || res.y <= 0 || bb.x <= 0 || bb.y <= 0 )
++        return;
++
++    INT2 size( std::max( 32, static_cast<int>(g_CoopSV.w * bb.x) ), 0 );
++    size.y = std::max( 18, static_cast<int>(size.x * static_cast<float>(res.y) / static_cast<float>(res.x)) );
++    INT2 pos( static_cast<int>(g_CoopSV.x * bb.x), static_cast<int>(g_CoopSV.y * bb.y) );
++    if ( pos.x + size.x + 2 > bb.x ) pos.x = std::max( 2, bb.x - size.x - 2 );
++    if ( pos.y + size.y + 2 > bb.y ) pos.y = std::max( 2, bb.y - size.y - 2 );
++
++    if ( !g_CoopSV.tex || g_CoopSV.texSize.x != size.x || g_CoopSV.texSize.y != size.y ) {
++        g_CoopSV.tex = std::make_unique<RenderToTextureBuffer>( GetDevice(), size.x, size.y, DXGI_FORMAT_R8G8B8A8_UNORM );
++        g_CoopSV.texSize = size;
++        g_CoopSV.texValid = false;
++    }
++
++    const bool redraw = !g_CoopSV.texValid || (++g_CoopSV.frame % static_cast<unsigned int>(g_CoopSV.everyNth)) == 0;
++    if ( redraw ) {
++        auto _ = RecordGraphicsEvent( L"GothicCoop SecondView" );
++
++        // Kamera umsetzen
++        zCVob* camVob = game->_zCSession_camVob;
++        XMFLOAT4X4* trafo = camVob->GetWorldMatrixPtr();
++        const XMFLOAT4X4 savedTrafo = *trafo;
++
++        // teure bzw. bilduebergreifend zwischengespeicherte Durchgaenge aus (Punktlicht-Schattenwuerfel gehoeren zum Licht und
++        // gelten fuer beide Bilder). Weltschatten bleiben an; EnableShadows steuert sonst auch die Modellfarbe (GothicAPI, "Let
++        // shadows do the work") - aus machte es die NPCs im Fenster dunkler als im Hauptbild.
++        auto& s = Engine::GAPI->GetRendererState().RendererSettings;
++        const auto savedPls = s.EnablePointlightShadows;
++        const bool savedHbao = s.HbaoSettings.Enabled;
++        const bool savedParticles = s.DrawParticleEffects;
++        const bool savedOcclusion = s.EnableOcclusionCulling;
++        s.EnablePointlightShadows = GothicRendererSettings::PLS_DISABLED;
++        s.HbaoSettings.Enabled = false;
++        s.DrawParticleEffects = false;
++        s.EnableOcclusionCulling = false;
++
++        *trafo = g_CoopSV.camToWorld;
++        cam->Activate();
++        Engine::GAPI->SetViewTransform( cam->GetTransformDX( zCCamera::ETransformType::TT_VIEW ), false );
++        Engine::GAPI->GetRendererState().RendererInfo.IsRenderingWorld = true;
++
++        SetDefaultStates();
++        D3D11_VIEWPORT vp;
++        vp.TopLeftX = 0.0f;
++        vp.TopLeftY = 0.0f;
++        vp.MinDepth = 0.0f;
++        vp.MaxDepth = 1.0f;
++        vp.Width = static_cast<float>(res.x);
++        vp.Height = static_cast<float>(res.y);
++        GetContext()->RSSetViewports( 1, &vp );
++
++        const float4 fog( Engine::GAPI->GetRendererState().GraphicsState.FF_FogColor, 0.0f );
++        const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
++        GetContext()->ClearDepthStencilView( DepthStencilBuffer->GetDepthStencilView().Get(), D3D11_CLEAR_DEPTH, 0, 0 );
++        GetContext()->ClearRenderTargetView( GBuffer0_Diffuse->GetRenderTargetView().Get(), reinterpret_cast<const float*>(&fog) );
++        GetContext()->ClearRenderTargetView( GBuffer1_Normals->GetRenderTargetView().Get(), zero );
++        GetContext()->ClearRenderTargetView( GBuffer2_SpecIntens_SpecPower->GetRenderTargetView().Get(), zero );
++        GetContext()->ClearRenderTargetView( HDRBackBuffer->GetRenderTargetView().Get(), zero );
++
++        ID3D11RenderTargetView* rtvs[] = {
++            GBuffer0_Diffuse->GetRenderTargetView().Get(),
++            GBuffer1_Normals->GetRenderTargetView().Get(),
++            GBuffer2_SpecIntens_SpecPower->GetRenderTargetView().Get() };
++        GetContext()->OMSetRenderTargets( 3, rtvs, DepthStencilBuffer->GetDepthStencilView().Get() );
++
++        RenderedVobs.clear();
++        FrameWaterSurfaces.clear();
++        FrameTransparencyMeshes.clear();
++        FrameTransparencyMeshesPortal.clear();
++        FrameTransparencyMeshesWaterfall.clear();
++
++        // coop4: eigene Schattenkarten fuer diesen Durchgang einsetzen
++        if ( !g_CoopSV.shadow ) {
++            g_CoopSV.shadow = std::make_unique<D3D11ShadowMap>();
++            g_CoopSV.shadow->Init( Device, Context, COOP_SECOND_VIEW_SHADOWMAP_SIZE );
++        }
++        // coop4: Tiefen-Kopie des Hauptbilds sichern - der Licht-Durchgang ueberschreibt sie (CopyDepthStencil); Present stellt
++        // den Tiefenpuffer daraus wieder her, Unterwasser-Effekte lesen sie
++        if ( !g_CoopSV.depthSave || g_CoopSV.depthSaveSize.x != res.x || g_CoopSV.depthSaveSize.y != res.y ) {
++            g_CoopSV.depthSave = std::make_unique<RenderToTextureBuffer>( GetDevice().Get(), res.x, res.y, DXGI_FORMAT_R32_TYPELESS,
++                nullptr, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT );
++            g_CoopSV.depthSaveSize = res;
++        }
++        GetContext()->CopyResource( g_CoopSV.depthSave->GetTexture().Get(), DepthStencilBufferCopy->GetTexture().Get() );
++        std::swap( ShadowMaps, g_CoopSV.shadow );
++
++        g_CoopSecondViewPass = true;
++        if ( s.DrawSky )
++            DrawSky();
++        Engine::GAPI->DrawWorldMeshNaive();
++        {
++            D3D11ENGINE_RENDER_STAGE oldStage = RenderingStage;
++            SetRenderingStage( DES_GHOST );
++            Engine::GAPI->DrawTransparencyVobs();   // leert die Liste - sonst zeichnete das naechste Hauptbild sie mit
++            SetRenderingStage( oldStage );
++        }
++        g_CoopSecondViewPass = false;
++
++        // coop4: Schattenkarten des Hauptbilds zurueck, Tiefe wie nach dem Hauptbild (Kopie = Welt, Puffer geleert fuer die UI)
++        std::swap( ShadowMaps, g_CoopSV.shadow );
++        GetContext()->CopyResource( DepthStencilBufferCopy->GetTexture().Get(), g_CoopSV.depthSave->GetTexture().Get() );
++        GetContext()->ClearDepthStencilView( DepthStencilBuffer->GetDepthStencilView().Get(), D3D11_CLEAR_DEPTH, 0, 0 );
++
++        // Listen dieses Durchgangs nicht ins naechste Hauptbild mitnehmen
++        FrameWaterSurfaces.clear();
++        FrameTransparencyMeshes.clear();
++        FrameTransparencyMeshesPortal.clear();
++        FrameTransparencyMeshesWaterfall.clear();
++
++        // Kamera und Einstellungen zurueck
++        *trafo = savedTrafo;
++        cam->Activate();
++        Engine::GAPI->SetViewTransform( cam->GetTransformDX( zCCamera::ETransformType::TT_VIEW ), false );
++        s.EnablePointlightShadows = savedPls;
++        s.HbaoSettings.Enabled = savedHbao;
++        s.DrawParticleEffects = savedParticles;
++        s.EnableOcclusionCulling = savedOcclusion;
++
++        SetDefaultStates();
++        PfxRenderer->CopyTextureToRTV( HDRBackBuffer->GetShaderResView(), g_CoopSV.tex->GetRenderTargetView(), size );
++        g_CoopSV.texValid = true;
++    }
++
++    // Rahmen + Bild in den Backbuffer
++    const float frameColor[4] = { 0.80f, 0.70f, 0.40f, 1.0f };
++    D3D11_RECT r = { pos.x - 2, pos.y - 2, pos.x + size.x + 2, pos.y + size.y + 2 };
++    GetContext()->ClearView( Backbuffer->GetRenderTargetView().Get(), frameColor, &r, 1 );
++    SetDefaultStates();
++    PfxRenderer->CopyTextureToRTV( g_CoopSV.tex->GetShaderResView(), Backbuffer->GetRenderTargetView(), size, false, pos );
++}
++
++// --- GothicCoop coop6: Figur-Vorschau im COOP-Menue (20.10.2026) -------------------------------------------------------------
++// GothicCoop baut die eigene Figur ohne Welt (zCVob + HUMANS.MDS, Koerper/Kopf/Gesicht/Hautton wie oCNpc::InitModel/SetHead)
++// und ruft GDX_CoopPreviewDraw aus dem Blit eines eigenen Menue-Fensters - also mitten im 2D-Teil, wie GD3D11 Inventar-Gegenstaende
++// zeichnet (DrawVobSingle). Gothics Weg (eigene Welt + zCWorld::Render) geht hier nicht: OnAddVob liest im Hauptmenue
++// oCGame::GetGame() (NULL), und Nebenwelten zeichnet GInventory nur als ein statisches Netz.
++// Vorwaerts in den Backbuffer: Koerper mit VS_ExSkeletal, Knoten-Visuals (Kopf, Morph-Mesh mit den Eckpunkten des aktuellen
++// Bilds) mit VS_Ex, beide mit PS_Preview_TexturedLit (Textur x einfaches Licht, Alpha-Test). Texturen selbst binden (nicht
++// BindTextureNRFX - das wuerde im Hauptdurchgang den Pixel-Shader auf den G-Buffer umstellen). Eigene Kamera ueber
++// CameraReplacement (Matrizen transponiert wie D3D11ShadowMap), eigener Viewport, Tiefe in m_NativeSizeDepthStencil (wie
++// DrawVobSingle) - danach Render-Ziele, Viewport, Sampler, Topologie, Shader, Zustaende und Matrizen zurueck.
++namespace {
++    struct CoopPreviewCache {
++        std::map<int, std::vector<MeshVisualInfo*>> attachments;
++        std::map<int, zCVisual*> attachmentVisual;
++    };
++    std::map<zCVob*, CoopPreviewCache> g_CoopPreview;
++}
++
++void D3D11GraphicsEngine::ReleaseCoopPreview( zCVob* vob ) {
++    auto it = g_CoopPreview.find( vob );
++    if ( it == g_CoopPreview.end() )
++        return;
++    for ( auto& [idx, list] : it->second.attachments )
++        for ( MeshVisualInfo* mi : list )
++            delete mi;
++    g_CoopPreview.erase( it );
++}
++
++int D3D11GraphicsEngine::RenderCoopPreview( zCVob* vob, float x, float y, float w, float h, float yawDeg, float camDist, float camHeight ) {
++    if ( !vob || !Backbuffer || !m_NativeSizeDepthStencil || w < 4.0f || h < 4.0f )
++        return 0;
++    zCVisual* visual = vob->GetVisual();
++    if ( !visual || strcmp( visual->GetFileExtension( 0 ), ".MDS" ) != 0 )
++        return 0;
++    zCModel* model = reinterpret_cast<zCModel*>(visual);
++    SkeletalMeshVisualInfo* vis = Engine::GAPI->LoadzCModelData( model );
++    if ( !vis || vis->SkeletalMeshes.empty() )
++        return 0;
++
++    // Rechteck: GothicCoop gibt Gothic-Bildpunkte (screen->psizex/psizey = GetResolution), gezeichnet wird im Backbuffer
++    const INT2 res = GetResolution();
++    const INT2 bb = GetBackbufferResolution();
++    if ( res.x <= 0 || res.y <= 0 || bb.x <= 0 || bb.y <= 0 )
++        return 0;
++    D3D11_VIEWPORT vp = {};
++    vp.TopLeftX = std::clamp( x * bb.x / res.x, 0.0f, static_cast<float>(bb.x - 4) );
++    vp.TopLeftY = std::clamp( y * bb.y / res.y, 0.0f, static_cast<float>(bb.y - 4) );
++    vp.Width = std::clamp( w * bb.x / res.x, 4.0f, bb.x - vp.TopLeftX );
++    vp.Height = std::clamp( h * bb.y / res.y, 4.0f, bb.y - vp.TopLeftY );
++    vp.MinDepth = 0.0f;
++    vp.MaxDepth = 1.0f;
++
++    // --- Zustand sichern
++    UINT numVp = 1;
++    D3D11_VIEWPORT oldVp = {};
++    Context->RSGetViewports( &numVp, &oldVp );
++    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> oldRtv;
++    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> oldDsv;
++    Context->OMGetRenderTargets( 1, oldRtv.GetAddressOf(), oldDsv.GetAddressOf() );
++    Microsoft::WRL::ComPtr<ID3D11SamplerState> oldSampler;
++    Context->PSGetSamplers( 0, 1, oldSampler.GetAddressOf() );
++    D3D11_PRIMITIVE_TOPOLOGY oldTopology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
++    Context->IAGetPrimitiveTopology( &oldTopology );
++    std::shared_ptr<D3D11VShader> oldVS = ActiveVS;
++    std::shared_ptr<D3D11PShader> oldPS = ActivePS;
++    GothicRendererState& rs = Engine::GAPI->GetRendererState();
++    const GothicDepthBufferStateInfo oldDepth = rs.DepthState;
++    const GothicBlendStateInfo oldBlend = rs.BlendState;
++    const GothicRasterizerStateInfo oldRaster = rs.RasterizerState;
++    const GothicTransformInfo oldTransform = rs.TransformState;
++
++    // --- Ziel, Tiefe, Zustaende
++    Context->OMSetRenderTargets( 1, Backbuffer->GetRenderTargetView().GetAddressOf(), m_NativeSizeDepthStencil->GetDepthStencilView().Get() );
++    Context->ClearDepthStencilView( m_NativeSizeDepthStencil->GetDepthStencilView().Get(), D3D11_CLEAR_DEPTH, 1.0f, 0 );
++    Context->RSSetViewports( 1, &vp );
++    rs.DepthState.SetDefault();
++    rs.DepthState.DepthBufferEnabled = true;
++    rs.DepthState.DepthWriteEnabled = true;
++    rs.DepthState.DepthBufferCompareFunc = GothicDepthBufferStateInfo::CF_COMPARISON_LESS_EQUAL;
++    rs.DepthState.SetDirty();
++    rs.BlendState.SetDefault();   // undurchsichtig, Alpha-Test im Shader
++    rs.BlendState.SetDirty();
++    rs.RasterizerState.SetDefault();
++    rs.RasterizerState.CullMode = GothicRasterizerStateInfo::CM_CULL_NONE;
++    rs.RasterizerState.SetDirty();
++    Context->PSSetSamplers( 0, 1, DefaultSamplerState.GetAddressOf() );
++
++    // --- Kamera: Blick von vorn (+Z der Figur) auf Figurmitte + camHeight
++    XMFLOAT4X4 vobWorld;
++    XMStoreFloat4x4( &vobWorld, vob->GetWorldMatrixXM() );
++    const XMVECTOR target = XMVectorSet( vobWorld._14, vobWorld._24 + camHeight, vobWorld._34, 0.0f );
++    const XMVECTOR eye = XMVectorAdd( target, XMVectorSet( 0.0f, 0.0f, camDist, 0.0f ) );
++    const XMVECTOR up = XMVectorSet( 0.0f, 1.0f, 0.0f, 0.0f );
++    const XMMATRIX viewDX = XMMatrixLookAtLH( eye, target, up );
++    const XMMATRIX projDX = XMMatrixPerspectiveFovLH( XMConvertToRadians( 30.0f ), vp.Width / vp.Height, 10.0f, 20000.0f );
++    CameraReplacement cr;
++    XMStoreFloat4x4( &cr.ViewReplacement, XMMatrixTranspose( viewDX ) );
++    XMStoreFloat4x4( &cr.ProjectionReplacement, XMMatrixTranspose( projDX ) );
++    XMStoreFloat3( &cr.PositionReplacement, eye );
++    XMStoreFloat3( &cr.LookAtReplacement, target );
++    Engine::GAPI->SetCameraReplacementPtr( &cr );
++    rs.TransformState.TransformView = cr.ViewReplacement;
++
++    // Welt: Lage des Vobs, um die eigene Hochachse gedreht (Gothic-Spaltenform wie GetWorldMatrixXM), Modellgroesse
++    const XMMATRIX rot = XMMatrixTranspose( XMMatrixRotationY( XMConvertToRadians( yawDeg ) ) );
++    const XMMATRIX world = XMMatrixMultiply( XMMatrixMultiply( vob->GetWorldMatrixXM(), rot ), XMMatrixScalingFromVector( model->GetModelScaleXM() ) );
++    XMStoreFloat4x4( &rs.TransformState.TransformWorld, world );
++
++    // --- Koerper (Skelett-Netze)
++    model->UpdateMeshLibTexAniState();
++    std::vector<XMFLOAT4X4> transforms;
++    model->GetBoneTransforms( &transforms );
++    SetActiveVertexShader( "VS_ExSkeletal" );
++    SetActivePixelShader( "PS_Preview_TexturedLit" );
++    SetupVS_ExMeshDrawCall();
++    SetupVS_ExConstantBuffer();
++    VS_ExConstantBuffer_PerInstanceSkeletal cb2 = {};
++    cb2.World = rs.TransformState.TransformWorld;
++    cb2.PI_ModelColor = float4( 1.0f, 1.0f, 1.0f, 1.0f );
++    cb2.PI_ModelFatness = model->GetModelFatness();
++    ActiveVS->GetConstantBuffer()[1]->UpdateBuffer( &cb2 );
++    ActiveVS->GetConstantBuffer()[1]->BindToVertexShader( 1 );
++    if ( !transforms.empty() ) {
++        ActiveVS->GetConstantBuffer()[2]->UpdateBuffer( &transforms[0], sizeof( XMFLOAT4X4 ) * std::min<UINT>( transforms.size(), NUM_MAX_BONES ) );
++        ActiveVS->GetConstantBuffer()[2]->BindToVertexShader( 2 );
++    }
++    ActiveVS->Apply();
++    ActivePS->Apply();
++    for ( auto const& itm : vis->SkeletalMeshes ) {
++        zCTexture* tex = itm.first ? itm.first->GetAniTexture() : nullptr;
++        if ( !tex || tex->CacheIn( 0.6f ) != zRES_CACHED_IN )
++            continue;
++        tex->Bind( 0 );
++        for ( SkeletalMeshInfo* mesh : itm.second ) {
++            if ( !mesh || !mesh->MeshVertexBuffer || !mesh->MeshIndexBuffer )
++                continue;
++            UINT offset = 0;
++            UINT stride = sizeof( ExSkelVertexStruct );
++            Context->IASetVertexBuffers( 0, 1, mesh->MeshVertexBuffer->GetVertexBuffer().GetAddressOf(), &stride, &offset );
++            Context->IASetIndexBuffer( mesh->MeshIndexBuffer->GetVertexBuffer().Get(), VERTEX_INDEX_DXGI_FORMAT, 0 );
++            Context->DrawIndexed( mesh->Indices.size(), 0, 0 );
++        }
++    }
++
++    // --- Knoten-Visuals (Kopf als Morph-Mesh)
++    CoopPreviewCache& cache = g_CoopPreview[vob];
++    zCArray<zCModelNodeInst*>* nodes = model->GetNodeList();
++    if ( nodes && !transforms.empty() ) {
++        SetActiveVertexShader( "VS_Ex" );
++        SetActivePixelShader( "PS_Preview_TexturedLit" );
++        SetupVS_ExMeshDrawCall();
++        SetupVS_ExConstantBuffer();
++        for ( int i = 0; i < nodes->NumInArray && i < static_cast<int>(transforms.size()); i++ ) {
++            zCModelNodeInst* node = nodes->Array[i];
++            if ( !node || !node->NodeVisual )
++                continue;
++            if ( cache.attachmentVisual[i] != node->NodeVisual ) {
++                WorldConverter::ExtractNodeVisual( i, node, cache.attachments );   // ersetzt einen alten Eintrag selbst
++                cache.attachmentVisual[i] = node->NodeVisual;
++            }
++            auto found = cache.attachments.find( i );
++            if ( found == cache.attachments.end() || found->second.empty() )
++                continue;
++            VS_ExConstantBuffer_PerInstance cbi = {};
++            XMStoreFloat4x4( &cbi.World, XMMatrixMultiply( world, XMLoadFloat4x4( &transforms[i] ) ) );
++            ActiveVS->GetConstantBuffer()[1]->UpdateBuffer( &cbi );
++            ActiveVS->GetConstantBuffer()[1]->BindToVertexShader( 1 );
++            node->TexAniState.UpdateTexList();
++            const bool isMMS = strcmp( node->NodeVisual->GetFileExtension( 0 ), ".MMS" ) == 0;
++            for ( MeshVisualInfo* mvi : found->second ) {
++                if ( isMMS ) {
++                    zCMorphMesh* mm = reinterpret_cast<zCMorphMesh*>(node->NodeVisual);
++                    mm->GetTexAniState()->UpdateTexList();
++                    mm->AdvanceAnis();
++                    mm->CalcVertexPositions();
++                    zCProgMeshProto* pm = mm->GetMorphMesh();
++                    if ( !pm )
++                        continue;
++                    XMFLOAT3* posList = pm->GetPositionList()->Array->toXMFLOAT3();
++                    for ( int s = 0; s < pm->GetNumSubmeshes(); s++ ) {
++                        zCSubMesh* sm = pm->GetSubmesh( s );
++                        zCTexture* tex = sm->Material ? sm->Material->GetAniTexture() : nullptr;
++                        if ( !tex || tex->CacheIn( 0.6f ) != zRES_CACHED_IN )
++                            continue;
++                        std::vector<ExVertexStruct> vertices;
++                        vertices.reserve( sm->WedgeList.NumInArray );
++                        for ( int v = 0; v < sm->WedgeList.NumInArray; v++ ) {
++                            zTPMWedge& wedge = sm->WedgeList.Array[v];
++                            vertices.emplace_back();
++                            ExVertexStruct& vx = vertices.back();
++                            vx.Position = posList[wedge.position];
++                            vx.Normal = wedge.normal;
++                            vx.TexCoord = wedge.texUV;
++                            vx.Color = 0xFFFFFFFF;
++                        }
++                        if ( vertices.empty() )
++                            continue;
++                        tex->Bind( 0 );
++                        for ( auto const& it : mvi->Meshes ) {
++                            for ( MeshInfo* mi : it.second ) {
++                                if ( mi->MeshIndex == static_cast<unsigned int>(s) ) {
++                                    mi->MeshVertexBuffer->UpdateBuffer( &vertices[0], vertices.size() * sizeof( ExVertexStruct ) );
++                                    DrawVertexBufferIndexed( mi->MeshVertexBuffer, mi->MeshIndexBuffer, mi->Indices.size() );
++                                }
++                            }
++                        }
++                    }
++                } else {
++                    for ( auto const& it : mvi->Meshes ) {
++                        zCTexture* tex = it.first ? it.first->GetAniTexture() : nullptr;
++                        if ( !tex || tex->CacheIn( 0.6f ) != zRES_CACHED_IN )
++                            continue;
++                        tex->Bind( 0 );
++                        for ( MeshInfo* mi : it.second )
++                            DrawVertexBufferIndexed( mi->MeshVertexBuffer, mi->MeshIndexBuffer, mi->Indices.size() );
++                    }
++                }
++            }
++        }
++    }
++
++    // --- Zustand zurueck
++    Engine::GAPI->SetCameraReplacementPtr( nullptr );
++    rs.TransformState = oldTransform;
++    rs.DepthState = oldDepth;
++    rs.DepthState.SetDirty();
++    rs.BlendState = oldBlend;
++    rs.BlendState.SetDirty();
++    rs.RasterizerState = oldRaster;
++    rs.RasterizerState.SetDirty();
++    UpdateRenderStates();
++    ActiveVS = oldVS;
++    ActivePS = oldPS;
++    if ( ActiveVS )
++        ActiveVS->Apply();
++    if ( ActivePS )
++        ActivePS->Apply();
++    Context->OMSetRenderTargets( 1, oldRtv.GetAddressOf(), oldDsv.Get() );
++    Context->RSSetViewports( 1, &oldVp );
++    Context->PSSetSamplers( 0, 1, oldSampler.GetAddressOf() );
++    Context->IASetPrimitiveTopology( oldTopology );
++    return 1;
++}
++
+ void D3D11GraphicsEngine::SetupVS_ExMeshDrawCall() {
+     UpdateRenderStates();
+ 
+@@ -4869,7 +5309,7 @@ XRESULT D3D11GraphicsEngine::DrawVOBsInstanced() {
+             }
+         }
+ 
+-        if ( Engine::GAPI->GetRendererState().RendererSettings.AnimateStaticVobs ) {
++        if ( Engine::GAPI->GetRendererState().RendererSettings.AnimateStaticVobs && !g_CoopSecondViewPass ) {   // GothicCoop: nicht doppelt je Bild
+             UpdateMorphMeshVisual();
+         }
+ 
+diff --git a/D3D11Engine/D3D11GraphicsEngine.h b/D3D11Engine/D3D11GraphicsEngine.h
+index 8fb04d0..4985e71 100644
+--- a/D3D11Engine/D3D11GraphicsEngine.h
++++ b/D3D11Engine/D3D11GraphicsEngine.h
+@@ -263,6 +263,15 @@ public:
+     /** Called when we started to render the world */
+     virtual XRESULT OnStartWorldRendering();
+ 
++    /** GothicCoop: Zweitbild (Fenster oben rechts) aus einer zweiten Kamera - nach dem Hauptbild, vor der Oberflaeche */
++    void RenderCoopSecondView();
++
++    /** GothicCoop (coop6): Figur (zCModel eines Vobs ohne Welt) sofort vorwaerts in ein Rechteck des Backbuffers zeichnen -
++        fuer die Vorschau im COOP-Menue. Aufruf mitten im 2D-Teil (wie DrawVobSingle fuers Inventar). 1 = gezeichnet. */
++    int RenderCoopPreview( zCVob* vob, float x, float y, float w, float h, float yawDeg, float camDist, float camHeight );
++    /** GothicCoop (coop6): zwischengespeicherte Knoten-Netze (Kopf) eines Vorschau-Vobs freigeben */
++    void ReleaseCoopPreview( zCVob* vob );
++
+     /** Draws the sky using the GSky-Object */
+     virtual XRESULT DrawSky();
+ 
+diff --git a/D3D11Engine/D3D11ShadowMap.cpp b/D3D11Engine/D3D11ShadowMap.cpp
+index 3060f8c..15a7a5c 100644
+--- a/D3D11Engine/D3D11ShadowMap.cpp
++++ b/D3D11Engine/D3D11ShadowMap.cpp
+@@ -160,7 +160,7 @@ static void CalculateCascadeMatrices(
+     FXMVECTOR lightPos,
+     FXMVECTOR lookAt,
+     FXMVECTOR upDir,
+-    GXMVECTOR shadowCameraPos,
++    const XMVECTOR& shadowCameraPos,   // GothicCoop coop5: war GXMVECTOR (siehe Aufruf in DrawLighting)
+     UINT shadowMapSize )
+ {
+     // Cascade-spezifische Größe basierend auf Split-Verhältnis
+@@ -215,6 +215,10 @@ static void CalculateCascadeMatrices(
+     XMStoreFloat3( &outCR.LookAtReplacement, lookAt );
+ }
+ 
++// GothicCoop: Zweitbild-Durchgang (D3D11GraphicsEngine::RenderCoopSecondView) - dann eigener bilduebergreifender
++// Kaskaden-Zustand (coop4) und keine Regen-Schattenkarte.
++extern bool g_CoopSecondViewPass;
++
+ XRESULT D3D11ShadowMap::DrawLighting( std::vector<VobLightInfo*>& lights ) {
+     auto graphicsEngine = reinterpret_cast<D3D11GraphicsEngine*>(Engine::GraphicsEngine);
+     auto _ = graphicsEngine->RecordGraphicsEvent( L"DrawLighting" );
+@@ -361,6 +365,12 @@ XRESULT D3D11ShadowMap::DrawLighting( std::vector<VobLightInfo*>& lights ) {
+     auto splits = ComputeCascadeSplits( nearPlane, farPlane, numCascades, lambdaBiasTable[numCascades].lambda, lambdaBiasTable[numCascades].bias );
+     splits[numCascades] = baseFarPlane; // Let the last cascade reach the full far plane
+ 
++    // GothicCoop coop4: bilduebergreifender Kaskaden-Zustand je Durchgang getrennt - [0] Hauptbild, [1] Zweitbild. Das Zweitbild
++    // rechnet eigene Kaskaden um die Zweitkamera in eine eigene D3D11ShadowMap (RenderCoopSecondView tauscht ShadowMaps). Die
++    // Zustaende unten waren nur statisch und damit geteilt: coop1 verstellte so die Schatten des Hauptbilds, coop2/coop3 nahmen
++    // dafuer die Kaskaden des Hauptbilds - die decken nur dessen Sicht (Vob-Schatten nur von dort sichtbaren Vobs, Kanten).
++    const int coopSlot = g_CoopSecondViewPass ? 1 : 0;
++
+     // Get current light direction from atmosphere
+     XMVECTOR currentDir = XMLoadFloat3( Engine::GAPI->GetSky()->GetAtmosphereCB().AC_LightPos.toXMFLOAT3() );
+     currentDir = XMVector3Normalize( currentDir );
+@@ -374,16 +384,20 @@ XRESULT D3D11ShadowMap::DrawLighting( std::vector<VobLightInfo*>& lights ) {
+         XMVECTOR LightDir;
+         XMVECTOR Position;
+         bool initialized;
+-    } lastCascadeData = {};
++    } lastCascadeDataSlots[2] = {};   // GothicCoop coop4: je Durchgang
++    auto& lastCascadeData = lastCascadeDataSlots[coopSlot];
+ 
+     static struct {
+         size_t frameCount;
+         std::array<CameraReplacement, MAX_CSM_CASCADES> PreviousCascadeCRs;
+-    } perFrameCascadeData = {};
++    } perFrameCascadeDataSlots[2] = {};   // GothicCoop coop4: je Durchgang
++    auto& perFrameCascadeData = perFrameCascadeDataSlots[coopSlot];
++
++    static XMVECTOR s_previousLightDirSlots[2] = { currentDir, currentDir };   // GothicCoop coop4: je Durchgang
++    static bool s_lightDirInitializedSlots[2] = {};
++    XMVECTOR& s_previousLightDir = s_previousLightDirSlots[coopSlot];
++    bool& s_lightDirInitialized = s_lightDirInitializedSlots[coopSlot];
+ 
+-    static XMVECTOR s_previousLightDir = currentDir;
+-    static bool s_lightDirInitialized = false;
+-    
+     XMVECTOR dir;
+     
+     if ( Engine::GAPI->GetRendererState().RendererSettings.SmoothShadowCameraUpdate ) {
+@@ -415,7 +429,8 @@ XRESULT D3D11ShadowMap::DrawLighting( std::vector<VobLightInfo*>& lights ) {
+         lastCascadeData.LightDir,
+         500.0f);
+ 
+-    static XMVECTOR oldP = XMVectorZero();
++    static XMVECTOR oldPSlots[2] = { XMVectorZero(), XMVectorZero() };   // GothicCoop coop4: je Durchgang
++    XMVECTOR& oldP = oldPSlots[coopSlot];
+     XMVECTOR WorldShadowCP;
+     // Update position
+     // Try to update only if the camera went 200 units away from the last position
+@@ -440,7 +455,8 @@ XRESULT D3D11ShadowMap::DrawLighting( std::vector<VobLightInfo*>& lights ) {
+     }
+ 
+     // Indoor check
+-    static zTBspMode lastBspMode = zBSP_MODE_OUTDOOR;
++    static zTBspMode lastBspModeSlots[2] = { zBSP_MODE_OUTDOOR, zBSP_MODE_OUTDOOR };   // GothicCoop coop4: je Durchgang
++    zTBspMode& lastBspMode = lastBspModeSlots[coopSlot];
+ 
+     // Array für alle Cascade-Matrizen
+     std::array<CameraReplacement, MAX_CSM_CASCADES> cascadeCRs = {};
+@@ -505,6 +521,12 @@ XRESULT D3D11ShadowMap::DrawLighting( std::vector<VobLightInfo*>& lights ) {
+             }
+ 
+             if ( shouldUpdateCascade ) {
++                // GothicCoop coop5: der 4. Vektor war GXMVECTOR (x86: Wertuebergabe) in einer Funktion ohne XM_CALLCONV. VS2019
++                // (v142, Release_G1_AVX2) legte hier den Wert auf den Stapel, CalculateCascadeMatrices las dort einen Zeiger -
++                // die x-Koordinate als Adresse: zufaellige Schattenkamera-Lage (Schatten flackerten in coop0-coop4) und
++                // Zugriffsfehler, wenn die Adresse unbelegt war (Test coop4: Absturz auf beiden PCs). Der GitHub-Build (VS2022)
++                // uebergibt einen Zeiger auf eine Kopie. Jetzt ausdruecklich Referenz auf eine benannte Variable.
++                const XMVECTOR shadowCameraPos = isLastCascade ? lastCascadeData.Position : WorldShadowCP;
+                 CalculateCascadeMatrices(
+                     cascadeCRs[cascadeIdx],
+                     splits,
+@@ -514,7 +536,7 @@ XRESULT D3D11ShadowMap::DrawLighting( std::vector<VobLightInfo*>& lights ) {
+                     isLastCascade ? lastCascadeP : p,
+                     isLastCascade ? lastCascadeLookAt : lookAt,
+                     c_XM_Up,
+-                    isLastCascade ? lastCascadeData.Position : WorldShadowCP,
++                    shadowCameraPos,
+                     GetSizeX() );
+ 
+                 // Store the current cascade matrix for future frames when we skip updates
+@@ -551,7 +573,7 @@ XRESULT D3D11ShadowMap::DrawLighting( std::vector<VobLightInfo*>& lights ) {
+     Engine::GAPI->SetCameraReplacementPtr( nullptr );
+ 
+     // Draw rainmap, if raining
+-    if ( Engine::GAPI->GetSceneWetness() > 0.00001f ) {
++    if ( Engine::GAPI->GetSceneWetness() > 0.00001f && !g_CoopSecondViewPass ) {
+         auto _ = graphicsEngine->RecordGraphicsEvent( L"Rain Shadowmap" );
+         graphicsEngine->Effects->DrawRainShadowmap();
+     }
+@@ -630,8 +652,9 @@ XRESULT D3D11ShadowMap::DrawLighting( std::vector<VobLightInfo*>& lights ) {
+             }
+         }
+ 
+-        // Animate the light
+-        vob->DoAnimation();
++        // Animate the light (GothicCoop coop4: nur im Hauptbild - sonst liefe die Licht-Animation doppelt so schnell)
++        if ( !g_CoopSecondViewPass )
++            vob->DoAnimation();
+ 
+         plcb.PL_Color = float4( vob->GetLightColor() );
+         plcb.PL_Range = vob->GetLightRange();
+diff --git a/D3D11Engine/GothicAPI.cpp b/D3D11Engine/GothicAPI.cpp
+index 1b969ce..dcc665f 100644
+--- a/D3D11Engine/GothicAPI.cpp
++++ b/D3D11Engine/GothicAPI.cpp
+@@ -1297,7 +1297,12 @@ void GothicAPI::CalcPolyStripMeshes() {
+         //////////////////////////////
+ 
+         zCPolyStripInstance* pStripInst = pStrip->GetInstanceData();
+-        zCMaterial* mat = pStripInst->material;
++        zCMaterial* mat = pStripInst ? pStripInst->material : nullptr;
++        if ( !mat ) {
++            // GothicCoop coop2: Polystrip ohne Material (Othello, Test 19.10.2026: Zugriffsfehler in zCMaterial::GetAniTexture
++            // auf this = NULL, aus CalcPolyStripMeshes) - auslassen statt abstuerzen
++            continue;
++        }
+         zCTexture* tx = mat->GetAniTexture();
+         if ( !tx ) {
+             tx = mat->GetTextureSingle();
+@@ -1412,7 +1417,12 @@ void GothicAPI::CalcFlashMeshes() {
+         pStrip->Render( pStrip );
+ 
+         zCPolyStripInstance* pStripInst = pStrip->GetInstanceData();
+-        zCMaterial* mat = pStripInst->material;
++        zCMaterial* mat = pStripInst ? pStripInst->material : nullptr;
++        if ( !mat ) {
++            // GothicCoop coop2: Polystrip ohne Material (Othello, Test 19.10.2026: Zugriffsfehler in zCMaterial::GetAniTexture
++            // auf this = NULL, aus CalcPolyStripMeshes) - auslassen statt abstuerzen
++            continue;
++        }
+         zCTexture* tx = mat->GetAniTexture();
+         if ( !tx ) {
+             tx = mat->GetTextureSingle();
+diff --git a/D3D11Engine/IkarusBindings.cpp b/D3D11Engine/IkarusBindings.cpp
+index 11adab0..3608e8f 100644
+--- a/D3D11Engine/IkarusBindings.cpp
++++ b/D3D11Engine/IkarusBindings.cpp
+@@ -9,6 +9,9 @@
+ #include "zSTRING.h"
+ #include "zCParser.h"
+ 
++// GothicCoop: Zweitbild - in D3D11GraphicsEngine.cpp
++void D3D11GraphicsEngine_CoopSecondViewSet( int enabled, const float* camToWorld, float x, float y, float w, int everyNth );
++
+ extern "C"
+ {
+     /** Draws a red cross at the given location in the current frame
+@@ -183,4 +186,42 @@ extern "C"
+         Engine::GAPI->SaveRendererWorldSettings( Engine::GAPI->GetRendererState().RendererSettings );
+         Engine::GAPI->SaveMenuSettings( MENU_SETTINGS_FILE );
+     }
++
++    /** GothicCoop (Othello-Coop, 19.10.2026): Zweitbild (Fenster) aus einer zweiten Kamera, z. B. beim Mitspieler.
++        - enabled: 0 = aus
++        - camToWorld: 16 floats, Lage/Ausrichtung der Kamera wie zCVob::trafoObjToWorld (zMAT4, Zeile fuer Zeile)
++        - x, y, w: Fenster in Bildanteilen (links, oben, Breite); die Hoehe folgt dem Seitenverhaeltnis des Bildes
++        - everyNth: Szene nur jedes n-te Bild neu zeichnen (1 = jedes Bild), dazwischen bleibt das letzte Bild stehen
++        Jedes Bild neu aufrufen, solange die Kamera sich bewegt. Siehe D3D11GraphicsEngine::RenderCoopSecondView. */
++    __declspec(dllexport) void __cdecl GDX_CoopSecondView( int enabled, const float* camToWorld, float x, float y, float w, int everyNth ) {
++        D3D11GraphicsEngine_CoopSecondViewSet( enabled, camToWorld, x, y, w, everyNth );
++    }
++
++    /** GothicCoop: Fassung der Zweitbild-Schnittstelle (1 = GDX_CoopSecondView wie oben) */
++    __declspec(dllexport) int __cdecl GDX_CoopSecondViewVersion( void ) {
++        return 1;
++    }
++
++    /** GothicCoop (coop6, 20.10.2026): Figur-Vorschau im COOP-Menue.
++        - vob: zCVob mit zCModel-Visual (HUMANS.MDS), ohne Welt; GothicCoop bewegt die Animation selbst (zCModel::AdvanceAnis)
++        - x, y, w, h: Rechteck in Gothic-Bildpunkten (screen->psizex/psizey)
++        - yawDeg: Drehung der Figur um ihre Hochachse; camDist/camHeight: Kamera vor der Figur (cm), Blick auf Lage + camHeight
++        Zeichnet sofort - nur aus dem 2D-Teil eines Bilds aufrufen (z. B. aus dem Blit eines Menue-Fensters). 1 = gezeichnet,
++        0 = nichts (kein Modell/Netz). Siehe D3D11GraphicsEngine::RenderCoopPreview. */
++    __declspec(dllexport) int __cdecl GDX_CoopPreviewDraw( void* vob, float x, float y, float w, float h, float yawDeg, float camDist, float camHeight ) {
++        if ( !vob || !Engine::GraphicsEngine )
++            return 0;
++        return reinterpret_cast<D3D11GraphicsEngine*>(Engine::GraphicsEngine)->RenderCoopPreview( reinterpret_cast<zCVob*>(vob), x, y, w, h, yawDeg, camDist, camHeight );
++    }
++
++    /** GothicCoop (coop6): zwischengespeicherte Kopf-/Knoten-Netze eines Vorschau-Vobs freigeben (vor dem Loeschen des Vobs) */
++    __declspec(dllexport) void __cdecl GDX_CoopPreviewRelease( void* vob ) {
++        if ( vob && Engine::GraphicsEngine )
++            reinterpret_cast<D3D11GraphicsEngine*>(Engine::GraphicsEngine)->ReleaseCoopPreview( reinterpret_cast<zCVob*>(vob) );
++    }
++
++    /** GothicCoop: Fassung der Vorschau-Schnittstelle (1 = GDX_CoopPreviewDraw/Release wie oben) */
++    __declspec(dllexport) int __cdecl GDX_CoopPreviewVersion( void ) {
++        return 1;
++    }
+ };
