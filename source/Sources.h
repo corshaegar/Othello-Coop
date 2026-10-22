@@ -29,6 +29,8 @@
 #include "CoopLogShip.cpp"     // v34/v35: Coop-Logs zum Partner (GothicCoopOthelloClient.log / GothicCoopOthelloHost.log)
 #include "CoopSelfTest.cpp"    // v37/v38: Coop-Testlauf (Shift+F11), v38 mit 28 Schritten und eigenen Test-NPCs
 #include "CoopCombatLead.cpp"  // v72: Kampf-Uebergabe - NPCs, die gegen einen Client kaempfen, rechnet dessen PC
+#include "CoopTeleport.cpp"    // v102: Teleport-Rune zum Mitspieler (COOP_ITEMS.D, Ziel Mitspieler, Mana 0, Startausstattung)
+#include "CoopPartnerMarker.cpp" // v104: Mitspieler-Markierung (Name ueber dem Kopf, Pfeil am Bildrand, Marke auf Othellos Karte)
 #include "Client.cpp"
 #include "Server.cpp"
 #include "MappedPort.cpp"

@@ -9,6 +9,8 @@ namespace GOTHIC_ENGINE {
 
     void _Game_Init() {
         Game_Init();
+        CoopCrashFilterPulse();   // v101 (A18b): GTs Absturz-Filter vor Othellos (Hooks.cpp)
+        CoopRuneLookInit();       // v106: eigenes Aussehen der Teleport-Rune (CoopTeleport.cpp)
     }
 
     void _Game_Loop() {
@@ -18,6 +20,7 @@ namespace GOTHIC_ENGINE {
                 sabotageChecked = true;
                 CoopOthelloSabotageCheck("erstes Spielbild", false);
             }
+            CoopCrashFilterPulse();     // v101 (A18b): Othello setzt seinen Absturz-Filter bei SetIsActive neu - GT bleibt davor
             CoopMenuMouseGameFrame();   // v57: ohne offenes Menue Zeiger weg
             CoopLangRefresh();          // v95: Sprache der Coop-Anzeigen (Gothic.ini coopLang)
             Game_Loop();
@@ -51,6 +54,8 @@ namespace GOTHIC_ENGINE {
                 sabotageChecked = true;
                 CoopOthelloSabotageCheck("erstes Menuebild", false);
             }
+            CoopCrashFilterPulse();   // v101 (A18b)
+            CoopRuneLookInit();       // v106: falls beim Start noch nicht moeglich
             CoopLangRefresh();        // v95: Sprache der Coop-Anzeigen (Gothic.ini coopLang)
             CoopLobbyPulse();
             CoopSteamPulse();         // v87: Steam - auch im Hauptmenue (Rueckrufe, Tunnel, Beitreten aus Steam)
@@ -112,6 +117,7 @@ namespace GOTHIC_ENGINE {
     void _LoadBegin() {
         try {
             CoopMenuMouseHide();   // v57: kein Zeiger ueber dem Ladebild
+            CoopRuneLookInit();    // v106: vor dem Anlegen der Gegenstaende aus dem Spielstand
             LoadBegin();
         }
         catch (std::exception& e) {

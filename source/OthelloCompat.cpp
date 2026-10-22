@@ -35,7 +35,7 @@ namespace GOTHIC_ENGINE {
     // beginnt. Jeder Log-Schreiber ruft CoopLogArchiveOnce() vor seinem ersten fopen. Danach steht die Fassung im neuen Log.
     // Nur Windows-Aufrufe, keine Engine-Stelle.
 
-#define COOP_OTHELLO_FASSUNG "v97"
+#define COOP_OTHELLO_FASSUNG "v106"
 
     // --- v95: Sprache der Coop-Anzeigen ----------------------------------------------------------
     // Nutzer: "dass man die Sprache der Coop-Einstellungen und Anzeigen auf Englisch stellen kann". Gothic.ini [GOTHICCOOP]
@@ -75,6 +75,36 @@ namespace GOTHIC_ENGINE {
 
     static long CoopLogSessionStart = 0;   // ab hier gehoert system\GothicCoopOthello.log zu diesem Start
 
+    // v98 (A15): Archiv und Haupt-Log mit festen Pfaden. Test v97: auf beiden PCs seit v81 kein Archiv mehr, die Logs wuchsen ueber
+    // alle Starts (letzte Kopfzeile v79). Ursache: seit v81 schreibt Game_Entry (CoopMenuInjectInstall) die erste Logzeile, solange
+    // der Arbeitsordner noch system\ ist (dort liegt auch GothicCoopConfig.json) - erst danach wechselt Gothic in den Spielordner.
+    // "system\GothicCoop*.log" zeigte dann auf system\system\: nichts gefunden, Kopfzeile ins Leere, das Archiv galt fuer diesen
+    // Start als erledigt. Jetzt: Spielordner = Ordner ueber dem Ordner von GothicMod.exe (system\), unabhaengig vom Arbeitsordner.
+    static const std::string& CoopGameRoot() {
+        static const std::string root = [] {
+            char p[MAX_PATH] = "";
+            GetModuleFileNameA(NULL, p, MAX_PATH);
+            std::string s = p;
+            const size_t a = s.find_last_of("\\/");
+            if (a != std::string::npos)
+                s.resize(a);   // ...\system
+            const size_t b = s.find_last_of("\\/");
+            if (b != std::string::npos && _stricmp(s.c_str() + b + 1, "system") == 0)
+                s.resize(b);   // Spielordner
+            else {             // ungewoehnlicher Aufbau: wie bisher relativ zum Arbeitsordner
+                char c[MAX_PATH] = "";
+                GetCurrentDirectoryA(MAX_PATH, c);
+                s = c;
+            }
+            return s;
+        }();
+        return root;
+    }
+
+    static std::string CoopSystemFile(const char* name) {
+        return CoopGameRoot() + "\\system\\" + name;
+    }
+
     static CRITICAL_SECTION* CoopLogArchiveLock() {
         static CRITICAL_SECTION cs;
         static bool ready = (InitializeCriticalSection(&cs), true);
@@ -95,7 +125,8 @@ namespace GOTHIC_ENGINE {
         std::vector<Entry> files;
         FILETIME newest = { 0, 0 };
         WIN32_FIND_DATAA fd;
-        HANDLE h = FindFirstFileA("system\\GothicCoop*.log", &fd);
+        const std::string& root = CoopGameRoot();   // v98 (A15)
+        HANDLE h = FindFirstFileA(CoopSystemFile("GothicCoop*.log").c_str(), &fd);
         if (h != INVALID_HANDLE_VALUE) {
             do {
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
@@ -115,7 +146,7 @@ namespace GOTHIC_ENGINE {
             char ver[32] = "vor-v35";
             int y = 0, mo = 0, d = 0, hh = 0, mi = 0, ss = 0;
             bool haveStart = false;
-            if (FILE* old = fopen("system\\GothicCoopOthello.log", "r")) {
+            if (FILE* old = fopen(CoopSystemFile("GothicCoopOthello.log").c_str(), "r")) {
                 char line[256] = "";
                 char v[32] = "";
                 if (fgets(line, sizeof(line), old) &&
@@ -138,8 +169,8 @@ namespace GOTHIC_ENGINE {
                 FileTimeToSystemTime(&loc, &st);
                 y = st.wYear; mo = st.wMonth; d = st.wDay; hh = st.wHour; mi = st.wMinute; ss = st.wSecond;
             }
-            CreateDirectoryA("CoopLogs", NULL);
-            const std::string verDir = std::string("CoopLogs\\") + ver;
+            CreateDirectoryA((root + "\\CoopLogs").c_str(), NULL);
+            const std::string verDir = root + "\\CoopLogs\\" + ver;
             CreateDirectoryA(verDir.c_str(), NULL);
             char base[MAX_PATH];
             _snprintf(base, sizeof(base), "%s\\%04d-%02d-%02d_%02d-%02d-%02d", verDir.c_str(), y, mo, d, hh, mi, ss);
@@ -153,8 +184,9 @@ namespace GOTHIC_ENGINE {
                 target = std::string(base) + "_" + std::to_string(n);
             }
             int moved = 0, kept = 0;
+            const std::string shown = target.empty() ? std::string("(kein Ordner)") : target.substr(root.size() + 1);   // CoopLogs\...
             for (auto& f : files) {
-                const std::string src = "system\\" + f.name;
+                const std::string src = CoopSystemFile(f.name.c_str());
                 if (!target.empty() &&
                     MoveFileExA(src.c_str(), (target + "\\" + f.name).c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) {
                     moved++;
@@ -169,14 +201,13 @@ namespace GOTHIC_ENGINE {
             }
             if (kept)
                 _snprintf(note, sizeof(note), "Log-Archiv: %d Datei(en) der vorigen Sitzung nach %s\\ verschoben, %d nicht"
-                    " verschiebbar (bleiben in system\\ und werden weiter angehaengt)", moved,
-                    target.empty() ? "(kein Ordner)" : target.c_str(), kept);
+                    " verschiebbar (bleiben in system\\ und werden weiter angehaengt)", moved, shown.c_str(), kept);
             else
                 _snprintf(note, sizeof(note), "Log-Archiv: %d Datei(en) der vorigen Sitzung nach %s\\ verschoben", moved,
-                    target.c_str());
+                    shown.c_str());
         }
         note[sizeof(note) - 1] = 0;
-        FILE* f = fopen("system\\GothicCoopOthello.log", "a");
+        FILE* f = fopen(CoopSystemFile("GothicCoopOthello.log").c_str(), "a");
         if (f) {
             SYSTEMTIME now;
             GetLocalTime(&now);
@@ -201,7 +232,8 @@ namespace GOTHIC_ENGINE {
     static void OthelloCompatLog(const char* fmt, ...) {
         EnterCriticalSection(OthelloCompatLogLock());
         CoopLogArchiveOnce();   // v35: vorige Sitzung zuerst archivieren
-        FILE* f = fopen("system\\GothicCoopOthello.log", "a");
+        static const std::string path = CoopSystemFile("GothicCoopOthello.log");   // v98 (A15): auch vor dem Ordnerwechsel
+        FILE* f = fopen(path.c_str(), "a");
         if (f) {
             va_list ap;
             va_start(ap, fmt);

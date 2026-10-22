@@ -59,6 +59,40 @@ namespace GOTHIC_ENGINE {
                 before == player ? "eigener Held" : (before ? before->GetObjectName().ToChar() : "-"));
     }
 
+    // v98 (C20): Nutzer (Test v97): "Manchmal machen die NPCs diese Animation, wenn sie das erste Mal angegriffen werden, aber diese
+    // kommt, wenn der Mitspieler sie angreift ... die NPCs sollten normal direkt wechseln". Log Host: NON_1503 (ZS_STANDAROUND) von
+    // FRIEND_1 getroffen -> ZS_REACTTODAMAGE (B_WhirlAround: Umdrehen T_SURPRISE_*), dann ZS_ASSESSENEMY, ZS_ASSESSFIGHTER mit dem
+    // Host-Helden als Gegner und nach 6 s zurueck in ZS_STANDAROUND - den Mitspieler griff er nie an. Ursache im Skript
+    // (G1/Othello ZS_ReactToDamage): nur bei Npc_IsPlayer(other) wird die Haltung feindlich; fuer die Figur (ein NSC) geht es ohne
+    // Haltungswechsel nach ZS_AssessEnemy, das sie (gil_none, neutral) nicht angreift. C3 half nur in ZS_ATTACK, denn
+    // OnDamage_Hit laeuft vor der Wahrnehmung. Jetzt beim Host: startet ein Mensch ZS_REACTTODAMAGE hoechstens 1 s nach dem Treffer
+    // einer Figur (ohne Treffer des Host-Helden dazwischen), startet er stattdessen ZS_ATTACK gegen sie - nach derselben Regel wie
+    // C3: nicht bei Begleitern/Beschwoerungen des Spielers, nicht, wenn er dem Spieler freundlich ist (dort sagt auch beim
+    // Spieler das Skript erst "Was soll das?"), nicht im Dialog. Engine wie C3/C13 (SetTmpAttitude, SetEnemy, StartAIState).
+    struct CoopFigureHitNote { oCNpc* figure; long long ms; };
+    static std::map<oCNpc*, CoopFigureHitNote> CoopFigureHits;
+
+    static void CoopNoteFigureHit(oCNpc* npc, oCNpc* figure) {
+        if (CoopFigureHits.size() > 256)
+            CoopFigureHits.clear();   // nur kurzlebige Merker
+        CoopFigureHits[npc] = { figure, CurrentMs };
+    }
+
+    static bool CoopFigureHitTurnsHostile(oCNpc* npc) {
+        static int aivParty = -2, aivMmParty = -2;
+        if (!npc || npc == player || PlayerNpcs.count(npc) || npc->IsDead() || npc->IsUnconscious() || !npc->IsHuman())
+            return false;
+        if (aivParty == -2) {
+            aivParty = CoopAivIndex("AIV_PARTYMEMBER", 36);
+            aivMmParty = CoopAivIndex("AIV_MM_PARTYMEMBER", 23);
+        }
+        if ((aivParty >= 0 && npc->aiscriptvars[aivParty]) || (aivMmParty >= 0 && npc->aiscriptvars[aivMmParty]))
+            return false;
+        if (npc->GetPermAttitude(player) == NPC_ATT_FRIENDLY || npc->npcType == 3 /* NPCTYPE_FRIEND */)
+            return false;
+        return !IsPlayerTalkingWithNpc(npc) && !CoopNpcInDialogWithPlayer(npc);
+    }
+
     // v50 (C10): Nutzer (Test v49): "der Mitspieler war ausserhalb der Reichweite und sobald ein NPC angegriffen wurde, haben die
     // anderen nicht mehr reagiert, wenn sie angegriffen wurden". Log Host: VLK_10024_BUDDLER (saegt, ZS_SAW) von FRIEND_1 getroffen -
     // Zustand blieb ZS_SAW, kein Gegner; Bandit, Gardist und Reis-Buddler daneben reagierten. Ursache in Othellos Skript: ZS_SAW
@@ -88,6 +122,58 @@ namespace GOTHIC_ENGINE {
             OthelloCompatLog("[%lld s, %s] Schadens-Wahrnehmung ergaenzt: %s (Zustand %s hatte keine) - reagiert jetzt auf den Treffer",
                 DiagSeconds(), DiagRole(), npc->GetObjectName().ToChar(), npc->state.curState.name.ToChar());
     }
+
+    // v100 (C21): Nutzer (Test v99): "es gab immer noch die Animation wie beim ersten Schlag auf einen NPC bei Fokuswechsel mit dem
+    // Mitspieler". Log Host (Sarus, 721-754 s): alle 2 s "Kampf-Uebergabe an FRIEND_2" und "zurueck (anderes Ziel; Ziel HOST) -
+    // Kampf geht beim Host weiter". Jede Uebergabe startet ZS_ATTACK neu (beim Client LeadMineGive, beim Host LeadHostBack, die
+    // Umlenkung C13 ebenso), und Othellos ZS_Attack() ruft zu Beginn B_WhirlAround(self, other): kann der NPC das neue Ziel nicht
+    // sehen (es steht hinter ihm - der Mitspieler, der ihn von hinten schlaegt), AI_WhirlAround = Ueberraschungs-Sprung T_SURPRISE_*,
+    // sonst AI_TurnToNpc. Im Einzelspiel wechselt ein kaempfender NPC das Ziel ohne Neustart (B_CombatReactToDamage: Npc_SetTarget)
+    // und dreht sich einfach. Jetzt: wer ZS_ATTACK wegen einer Uebergabe/Umlenkung neu startet, wird 2 s vorgemerkt; seine naechste
+    // EV_WHIRLAROUND-Nachricht wird vor dem Start zu EV_TURNTOVOB (gleiches Ziel - normale Drehung). Der erste Treffer auf einen
+    // ruhigen NPC (ZS_ReactToDamage, C20) bleibt wie im Einzelspiel. Engine (Speicherabbild geprueft): oCNpc::EV_WhirlAround
+    // 0x0074ED50 und EV_TurnToVob 0x00750210 unveraendert, beide nur aus dem Nachrichten-Verteiler oCNpc::OnMessage (0x006A7463 /
+    // 0x006A743C, push msg, ecx = NPC). Allgemein (GT).
+    static std::map<oCNpc*, long long> CoopNoWhirlUntil;
+
+    void CoopNoWhirl(oCNpc* npc) {
+        if (!npc)
+            return;
+        if (CoopNoWhirlUntil.size() > 256)
+            CoopNoWhirlUntil.clear();   // nur kurzlebige Merker
+        CoopNoWhirlUntil[npc] = CurrentMs + 2000;
+    }
+
+    int __fastcall oCNpc_EV_WhirlAround_Coop(oCNpc* _this, void* vtable, oCMsgMovement* msg);
+    CInvoke<int(__thiscall*)(oCNpc*, oCMsgMovement*)> Ivk_oCNpc_EV_WhirlAround_Coop(0x0074ED50, &oCNpc_EV_WhirlAround_Coop);
+    int __fastcall oCNpc_EV_WhirlAround_Coop(oCNpc* _this, void* vtable, oCMsgMovement* msg) {
+        if (_this && msg && !CoopNoWhirlUntil.empty() && msg->subType == oCMsgMovement::EV_WHIRLAROUND && !msg->IsInUse()) {
+            auto it = CoopNoWhirlUntil.find(_this);
+            if (it != CoopNoWhirlUntil.end()) {
+                const bool fresh = it->second >= CurrentMs;
+                CoopNoWhirlUntil.erase(it);
+                if (fresh && msg->targetVob) {
+                    static CoopDiagBudget budget = { 0, 0 };
+                    if (CoopDiagAllow(budget, 20))
+                        OthelloCompatLog("[%lld s, %s] Zielwechsel ohne Ueberraschungs-Sprung: %s dreht sich zu %s (ZS_ATTACK-Neustart nach "
+                            "Uebergabe/Umlenkung)", DiagSeconds(), DiagRole(), _this->GetObjectName().ToChar(),
+                            msg->targetVob == player ? "eigenem Helden" : msg->targetVob->GetObjectName().ToChar());
+                    msg->subType = oCMsgMovement::EV_TURNTOVOB;
+                    return _this->EV_TurnToVob(msg);
+                }
+            }
+        }
+        return Ivk_oCNpc_EV_WhirlAround_Coop(_this, msg);
+    }
+
+    // v98 (A16): Ladebeginn (Plugin.cpp) - Merker zeigen auf NPCs der alten Welt
+    void CoopFigureHitsWorldGone() {
+        CoopFigureHits.clear();
+        CoopNoWhirlUntil.clear();   // v100 (C21)
+    }
+#else
+    void CoopFigureHitsWorldGone() {}
+    void CoopNoWhirl(oCNpc*) {}
 #endif
 
 #if ENGINE == Engine_G1
@@ -153,6 +239,118 @@ namespace GOTHIC_ENGINE {
         Ivk_oCNpc_CheckModelOverlays_Coop(_this);
     }
 
+    // v101 (A17): Absturz beim Host im Kampf (Test v100, Bildschirmfoto: Access Violation 0x005652E6 = zCModel::GetProgressPercent
+    // +0x26, Lesen von 0x00000008, aufgerufen aus OTHELLO_ABI+0x87F29). OTHELLO_ABI+0x87890 ist Othellos Ersatz fuer
+    // oCNpc::EV_Strafe (Aufruf aus oCNpc::OnMessage 0x006A7497, Bewegungs-Untertyp 13): beim ersten Durchlauf
+    // zCModel::StartAni(ani, 0) (0x005612A0), danach sofort GetProgressPercent(ani). GetProgressPercent(int) (0x005652C0, unveraendert)
+    // sucht die laufende Animation und liest ohne Pruefung aus ihr - laeuft sie nicht, Absturz. GT sperrt eigene Animationen
+    // einer Puppe (Host: NPC, den ein Client fuehrt; Client: NPC, den der Host fuehrt - zCModel_StartAni unten), die Kampf-KI des
+    // NPCs (oCAIHuman::FightMelee 0x00611872, EV_AttackForward/-Left/-Right) legt aber weiter Seitenschritte an. Allgemein (GT +
+    // Engine-Luecke; Othello prueft hier ebenso wenig wie Gothic). Jetzt: laeuft die Animation nicht, liefert GetProgressPercent
+    // 0 - Othellos Seitenschritt endet dann im naechsten Durchlauf von selbst (0x10088159: GetActiveAni == NULL -> fertig).
+    // Ebenso die Fassung mit Namen (0x00565210, unveraendert). GetActiveAni(int) 0x00560D90 unveraendert.
+    static void CoopProgressGuardLog(zCModel* model, const char* ani) {
+        static CoopDiagBudget budget = { 0, 0 };
+        if (!CoopDiagAllow(budget, 10))
+            return;
+        zCVob* v = model ? model->homeVob : NULL;
+        oCNpc* npc = (v && v->GetCharacterClass() == 2) ? (oCNpc*)v : NULL;
+        OthelloCompatLog("[%lld s, %s] Absturzschutz: GetProgressPercent(%s) ohne laufende Animation an %s%s - 0 statt Absturz",
+            DiagSeconds(), DiagRole(), ani, npc == player ? "eigenem Helden" : (v ? v->GetObjectName().ToChar() : "?"),
+            npc && CoopLeadIsRemote(npc) ? " (Puppe, ein Client fuehrt)" : "");
+    }
+
+    float __fastcall zCModel_GetProgressPercent_Coop(zCModel* _this, void* vtable, int aniID);
+    CInvoke<float(__thiscall*)(zCModel*, int)> Ivk_zCModel_GetProgressPercent_Coop(0x005652C0, &zCModel_GetProgressPercent_Coop);
+    float __fastcall zCModel_GetProgressPercent_Coop(zCModel* _this, void* vtable, int aniID) {
+        if (_this && !_this->GetActiveAni(aniID)) {
+            char id[24];
+            _snprintf(id, sizeof(id), "%d", aniID);
+            id[sizeof(id) - 1] = 0;
+            CoopProgressGuardLog(_this, id);
+            return 0.f;
+        }
+        return Ivk_zCModel_GetProgressPercent_Coop(_this, aniID);
+    }
+
+    float __fastcall zCModel_GetProgressPercentName_Coop(zCModel* _this, void* vtable, zSTRING const& name);
+    CInvoke<float(__thiscall*)(zCModel*, zSTRING const&)> Ivk_zCModel_GetProgressPercentName_Coop(0x00565210, &zCModel_GetProgressPercentName_Coop);
+    float __fastcall zCModel_GetProgressPercentName_Coop(zCModel* _this, void* vtable, zSTRING const& name) {
+        if (_this) {
+            const int id = _this->GetAniIDFromAniName(name);
+            if (id < 0 || !_this->GetActiveAni(id)) {
+                CoopProgressGuardLog(_this, name.ToChar());
+                return 0.f;
+            }
+        }
+        return Ivk_zCModel_GetProgressPercentName_Coop(_this, name);
+    }
+
+    // v105 (A19): Absturz beim Client kurz nach dem Laden (Test v104, "beim ersten Start gab es einen Crash"; Windows-Ereignis
+    // 22.10. 22:11:01: GothicMod.exe c0000005 bei +0x1A50F, kein Eintrag in den Coop-Logs). 0x0041A50F = zCCSManager::
+    // CreateNewCutscene(zSTRING&) mit this = NULL (mov eax, [ebx]), einziger Aufrufer zCCSPlayer::StartCutscene(zSTRING&, zCVob*)
+    // (0x0041CD00, +0xE3: ownerManager +0x60 ohne Pruefung). StartCutscene ruft ueber npc->homeWorld->csPlayer (+0x64) und vtable
+    // +0x1C oCNpc_States::DoAIState (0x006C612C, Tagesablauf-Zustand mit Cutscene) und oCNpc_States::StartCutscene (0x006C6450).
+    // Ohne Manager ist der Player einer, den zCCSManager::RemovePlayerFromList (0x0041A2F0: SetOwnerManager(NULL)) abgemeldet hat,
+    // waehrend die Welt ihn noch haelt - wer ihn abmeldet, ist offen (die Zeile unten zeigt die Umstaende). Ebenso ohne Pruefung:
+    // StartOutputUnit (0x0041D2E0, Dialogzeilen) und CreateNewOutputUnit (0x0041D000). Alle drei unveraendert (Speicherabbild).
+    // Jetzt: fehlt der Manager, haengt GT den Player der aktuellen Welt wieder an den Cutscene-Manager der Sitzung
+    // (zCSession::csMan +0x04, SetOwnerManager 0x0041C840 - nur das Feld) und laesst den Aufruf laufen; geht das nicht (anderer
+    // Player, kein Manager), liefert er NULL - wie die Engine, wenn Cutscenes gesperrt sind (DoAIState prueft auf NULL).
+    // Allgemein G1 (Engine-Luecke; Ausloeser offen).
+    static bool CoopCsOwnerCheck(zCCSPlayer* p, const char* what, const char* name, zCVob* vob) {
+        if (!p || p->ownerManager)
+            return true;
+        zCCSManager* man = ogame ? ogame->csMan : NULL;
+        zCWorld* w = ogame ? ogame->GetGameWorld() : NULL;
+        const bool worldPlayer = w && w->csPlayer == p;
+        int listed = 0;
+        if (man)
+            for (int i = 0; i < man->csPlayerList.GetNum(); i++)
+                if (man->csPlayerList[i] == p)
+                    listed = 1;
+        if (man && worldPlayer)
+            p->SetOwnerManager(man);
+        static CoopDiagBudget budget = { 0, 0 };
+        if (CoopDiagAllow(budget, 10))
+            OthelloCompatLog("[%lld s, %s] Absturzschutz: %s(%s) an %s - Cutscene-Player %p ohne Manager (Welt-Player %s, Manager der "
+                "Sitzung %p mit %d Playern, darin %s) - %s", DiagSeconds(), DiagRole(), what, name,
+                vob ? (vob == player ? "eigenem Helden" : vob->GetObjectName().ToChar()) : "-", (void*)p, worldPlayer ? "ja" : "nein",
+                (void*)man, man ? man->csPlayerList.GetNum() : 0, listed ? "ja" : "nein",
+                p->ownerManager ? "wieder angehaengt, laeuft" : "nicht gestartet");
+        return p->ownerManager != NULL;
+    }
+
+    zCCSCutsceneContext* __fastcall zCCSPlayer_StartCutscene_Coop(zCCSPlayer* _this, void* vtable, zSTRING& name, zCVob* vob);
+    CInvoke<zCCSCutsceneContext*(__thiscall*)(zCCSPlayer*, zSTRING&, zCVob*)> Ivk_zCCSPlayer_StartCutscene_Coop(0x0041CD00, &zCCSPlayer_StartCutscene_Coop);
+    zCCSCutsceneContext* __fastcall zCCSPlayer_StartCutscene_Coop(zCCSPlayer* _this, void* vtable, zSTRING& name, zCVob* vob) {
+        if (!CoopCsOwnerCheck(_this, "StartCutscene", name.ToChar(), vob))
+            return NULL;
+        return Ivk_zCCSPlayer_StartCutscene_Coop(_this, name, vob);
+    }
+
+    zCCSCutsceneContext* __fastcall zCCSPlayer_StartOutputUnit_Coop(zCCSPlayer* _this, void* vtable, int ou, zCVob* vob);
+    CInvoke<zCCSCutsceneContext*(__thiscall*)(zCCSPlayer*, int, zCVob*)> Ivk_zCCSPlayer_StartOutputUnit_Coop(0x0041D2E0, &zCCSPlayer_StartOutputUnit_Coop);
+    zCCSCutsceneContext* __fastcall zCCSPlayer_StartOutputUnit_Coop(zCCSPlayer* _this, void* vtable, int ou, zCVob* vob) {
+        char n[16];
+        _snprintf(n, sizeof(n), "%d", ou);
+        n[sizeof(n) - 1] = 0;
+        if (!CoopCsOwnerCheck(_this, "StartOutputUnit", n, vob))
+            return NULL;
+        return Ivk_zCCSPlayer_StartOutputUnit_Coop(_this, ou, vob);
+    }
+
+    zCCSCutsceneContext* __fastcall zCCSPlayer_CreateNewOutputUnit_Coop(zCCSPlayer* _this, void* vtable, int ou, zCVob* vob);
+    CInvoke<zCCSCutsceneContext*(__thiscall*)(zCCSPlayer*, int, zCVob*)> Ivk_zCCSPlayer_CreateNewOutputUnit_Coop(0x0041D000, &zCCSPlayer_CreateNewOutputUnit_Coop);
+    zCCSCutsceneContext* __fastcall zCCSPlayer_CreateNewOutputUnit_Coop(zCCSPlayer* _this, void* vtable, int ou, zCVob* vob) {
+        char n[16];
+        _snprintf(n, sizeof(n), "%d", ou);
+        n[sizeof(n) - 1] = 0;
+        if (!CoopCsOwnerCheck(_this, "CreateNewOutputUnit", n, vob))
+            return NULL;
+        return Ivk_zCCSPlayer_CreateNewOutputUnit_Coop(_this, ou, vob);
+    }
+
     // v69 (C16): beim Client keine eigene Kampf-KI fuer NPCs, die der Host fuehrt. Test v68: "der NPC hatte ja schon, waehrend
     // ich auf ihn geschlagen habe, dieses Problem" (dreht sich). Log Client: getroffene NPCs gingen hier in ZS_ASSESSENEMY,
     // ZS_ATTACK, ZS_PROCLAIMANDPUNISH, ZS_WATCHFIGHT (eigene Wahrnehmungen auf den eigenen Treffer und das Kampfgeraeusch), bis zu
@@ -195,6 +393,33 @@ namespace GOTHIC_ENGINE {
                     OthelloCompatLog("[%lld s, %s] Kampf-KI hier aus: %s startet %s nicht (ein Client fuehrt den NPC im Kampf)",
                         DiagSeconds(), DiagRole(), npc->GetObjectName().ToChar(), name);
                 return 1;
+            }
+        }
+        // v98 (C20): erster Treffer einer Figur - direkt angreifen statt ZS_REACTTODAMAGE (Umdrehen, dann oft gar nichts)
+        if (ServerThread && !WorldEditMode && !IsLoadingLevel && !isRtnState && index >= 0 && npc && parser && !CoopFigureHits.empty()) {
+            auto fh = CoopFigureHits.find(npc);
+            if (fh != CoopFigureHits.end()) {
+                oCNpc* figure = fh->second.figure;
+                const bool fresh = CurrentMs - fh->second.ms <= 1000;
+                zCPar_Symbol* sym = parser->GetSymbol(index);
+                const char* name = sym ? sym->name.ToChar() : NULL;
+                if (!fresh)
+                    CoopFigureHits.erase(fh);
+                else if (name && _stricmp(name, "ZS_REACTTODAMAGE") == 0) {
+                    CoopFigureHits.erase(fh);
+                    static int attackIndex = -2;
+                    if (attackIndex == -2)
+                        attackIndex = parser->GetIndex("ZS_ATTACK");
+                    if (attackIndex >= 0 && PlayerNpcs.count(figure) && !figure->IsDead() && CoopFigureHitTurnsHostile(npc)) {
+                        npc->SetTmpAttitude(NPC_ATT_HOSTILE);
+                        npc->SetEnemy(figure);
+                        static CoopDiagBudget c20Budget = { 0, 0 };
+                        if (CoopDiagAllow(c20Budget, 30))
+                            OthelloCompatLog("[%lld s, %s] Erster Treffer: %s greift %s direkt an (statt ZS_REACTTODAMAGE)", DiagSeconds(),
+                                DiagRole(), npc->GetObjectName().ToChar(), figure->GetObjectName().ToChar());
+                        return Ivk_oCNpc_States_StartAIState_Coop(_this, attackIndex, endOld, timeBehaviour, timed, isRtnState);
+                    }
+                }
             }
         }
         // v72: den selbst gefuehrten NPC (Kampf-Uebergabe) nicht sperren
@@ -243,6 +468,7 @@ namespace GOTHIC_ENGINE {
 #if ENGINE == Engine_G1
         if (ServerThread && damdesc.pNpcAttacker && damdesc.pNpcAttacker == player) {
             CoopPunishHostHit(_this);   // v54 (C13): Bestrafung durch dieses Opfer gilt dem Host zu Recht
+            CoopFigureHits.erase(_this);   // v98 (C20): die Reaktion gilt jetzt dem Host-Helden
             if (_this->GetAttitude(damdesc.pNpcAttacker) == NPC_ATT_HOSTILE) {
                 auto randValue = GetRandVal(0, 100);
                 if (randValue > 33) {
@@ -254,6 +480,7 @@ namespace GOTHIC_ENGINE {
         if (ServerThread && damdesc.pNpcAttacker && PlayerNpcs.count(damdesc.pNpcAttacker)) {
             CoopCombatRetarget(_this, damdesc.pNpcAttacker);
             CoopPunishMark(damdesc.pNpcAttacker, _this);   // v54 (C13): auch ohne Kampfgeraeusch (z. B. Zauber)
+            CoopNoteFigureHit(_this, damdesc.pNpcAttacker);   // v98 (C20): gleich folgendes ZS_REACTTODAMAGE -> Angriff
         }
         // v50 (C10): Treffer eines Spielers auf einen NPC ohne Schadens-Wahrnehmung (Othellos ZS_SAW)
         if (ServerThread && damdesc.pNpcAttacker && (damdesc.pNpcAttacker == player || PlayerNpcs.count(damdesc.pNpcAttacker)))
@@ -786,6 +1013,192 @@ namespace GOTHIC_ENGINE {
     // The body of this hook is copied from SaveErrorDetails because I cannot call SaveErrorDetails here no idea why.
     // TODO: Refactor :)
     // 
+    // v101 (A18): Test v100 - "erstmal Game-Freeze am Anfang": Windows-Ereignisprotokoll 20:43:37, GothicMod.exe c0000005 an
+    // Adresse 0 (Aufruf ueber einen leeren Zeiger), kein Eintrag in den Coop-Logs. Die Fehlerfenster (GTs Meldung und Gothics
+    // "Access Violation") lagen im Vollbild unsichtbar hinter dem Spiel - es sah aus wie ein Haenger. Jetzt schreibt der
+    // Absturz-Haken zuerst ins Log (Ausnahme, Stelle als Modul+Versatz, Register, Rueckspruenge vom Stapel) und legt das
+    // Spielfenster auf die Taskleiste, damit die Fenster zu sehen sind. Nur Windows-Aufrufe, keine Engine-Stelle.
+    static bool CoopCrashIsCode(DWORD a) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (a < 0x10000 || !VirtualQuery((LPCVOID)a, &mbi, sizeof(mbi)))
+            return false;
+        if (mbi.State != MEM_COMMIT || mbi.Type != MEM_IMAGE)
+            return false;
+        return (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+    }
+
+    // Rueckspruenge vom Stapel: Werte, die in Code zeigen und hinter einem call stehen (E8 rel32, FF /2)
+    static int CoopCrashScanStack(DWORD esp, DWORD* out, int max) {
+        int n = 0;
+        __try {
+            const NT_TIB* tib = (const NT_TIB*)NtCurrentTeb();
+            DWORD top = (DWORD)tib->StackBase;
+            if (esp < (DWORD)tib->StackLimit || esp >= top)
+                return 0;
+            if (top > esp + 0x4000)
+                top = esp + 0x4000;
+            for (DWORD p = esp; p + 4 <= top && n < max; p += 4) {
+                const DWORD a = *(const DWORD*)p;
+                if (!CoopCrashIsCode(a) || !CoopCrashIsCode(a - 7))
+                    continue;
+                const unsigned char* c = (const unsigned char*)a;
+                if (c[-5] == 0xE8 || (c[-6] == 0xFF && (c[-5] & 0x38) == 0x10) || (c[-3] == 0xFF && (c[-2] & 0x38) == 0x10) ||
+                    (c[-2] == 0xFF && (c[-1] & 0x38) == 0x10))
+                    out[n++] = a;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        return n;
+    }
+
+    static void CoopCrashWhere(DWORD addr, char* out, size_t len) {
+        HMODULE m = NULL;
+        char path[MAX_PATH] = "";
+        if (addr && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)addr, &m) &&
+            m && GetModuleFileNameA(m, path, MAX_PATH)) {
+            const char* file = strrchr(path, '\\');
+            _snprintf(out, len, "%s+0x%X", file ? file + 1 : path, addr - (DWORD)m);
+        }
+        else
+            _snprintf(out, len, "0x%08X", addr);
+        out[len - 1] = 0;
+    }
+
+    static void CoopCrashLog(struct _EXCEPTION_POINTERS* ep, const char* title = "ABSTURZ: Ausnahme") {
+        if (!ep || !ep->ExceptionRecord || !ep->ContextRecord)
+            return;
+        const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+        const CONTEXT* c = ep->ContextRecord;
+        char where[160], access[64] = "";
+        CoopCrashWhere(c->Eip, where, sizeof(where));
+        if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
+            _snprintf(access, sizeof(access), " (%s 0x%08X)", er->ExceptionInformation[0] == 0 ? "Lesen von" :
+                (er->ExceptionInformation[0] == 8 ? "Ausfuehren bei" : "Schreiben nach"), (DWORD)er->ExceptionInformation[1]);
+        access[sizeof(access) - 1] = 0;
+        OthelloCompatLog("[%lld s, %s] %s %08X bei %s%s | Faden %lu | Zustand %s", DiagSeconds(), DiagRole(), title,
+            er->ExceptionCode, where, access, GetCurrentThreadId(), PluginState.c_str());
+        OthelloCompatLog("  Register: EAX=%08X EBX=%08X ECX=%08X EDX=%08X ESI=%08X EDI=%08X EBP=%08X ESP=%08X", c->Eax, c->Ebx, c->Ecx,
+            c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
+        DWORD ret[24];
+        const int n = CoopCrashScanStack(c->Esp, ret, 24);
+        std::string chain;
+        for (int i = 0; i < n; i++) {
+            char w[160];
+            CoopCrashWhere(ret[i], w, sizeof(w));
+            chain += i ? " <- " : "";
+            chain += w;
+        }
+        OthelloCompatLog("  Rueckspruenge vom Stapel (neueste zuerst): %s", n ? chain.c_str() : "-");
+    }
+
+    // Einmal je Absturz: ins Log, dann das Spielfenster auf die Taskleiste (Fehlerfenster sichtbar)
+    static volatile LONG CoopCrashLogged = 0;
+
+    static void CoopCrashReport(struct _EXCEPTION_POINTERS* ep) {
+        if (InterlockedExchange(&CoopCrashLogged, 1))
+            return;
+        CoopCrashLog(ep);
+#if ENGINE == Engine_G1
+        HWND gameWnd = hWndApp ? hWndApp : *(HWND*)0x0086D30C;   // wie CoopMenuMouse.cpp
+#else
+        HWND gameWnd = hWndApp;
+#endif
+        if (gameWnd)
+            ShowWindowAsync(gameWnd, SW_MINIMIZE);
+    }
+
+    // v101 (A18b): Othello stellt einen eigenen Absturz-Filter (OTHELLO_ABI+0x70810 ueber SetUnhandledExceptionFilter, gesetzt von
+    // seinem Ersatz fuer zCExceptionHandler::SetIsActive OTHELLO_ABI+0x70960 und beim Start +0x70B40; er schreibt
+    // system\Othello_Crash_Reports.txt und zeigt "== application crashed") und reicht NICHT an Gothics Filter weiter - GTs Haken
+    // auf zCExceptionHandler::UnhandledExceptionFilter (0x004BF560) lief unter Othello nie. Jetzt legt sich GT selbst davor (beim
+    // Start und in jedem Spiel- und Menuebild, weil Othello seinen Filter bei SetIsActive neu setzt) und reicht danach an den
+    // vorigen Filter weiter - Othellos Bericht und Fenster bleiben. Allgemein: ohne Othello ist der vorige Gothics Filter.
+    static LPTOP_LEVEL_EXCEPTION_FILTER CoopNextCrashFilter = NULL;
+    static volatile LONG CoopCrashFilterDepth = 0;
+
+    static LONG WINAPI CoopTopCrashFilter(struct _EXCEPTION_POINTERS* ep) {
+        if (InterlockedIncrement(&CoopCrashFilterDepth) > 1) {   // Absturz im Absturz-Filter oder Kreis - nicht noch einmal
+            InterlockedDecrement(&CoopCrashFilterDepth);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        CoopCrashReport(ep);
+        LPTOP_LEVEL_EXCEPTION_FILTER next = CoopNextCrashFilter;
+        const LONG r = next ? next(ep) : EXCEPTION_CONTINUE_SEARCH;
+        InterlockedDecrement(&CoopCrashFilterDepth);
+        return r;
+    }
+
+    // v105 (A20): Test v104 - der Absturz beim Client (A19) lief an GTs und Othellos Filter vorbei (kein "ABSTURZ:" im Log,
+    // Othello_Crash_Reports.txt unveraendert, Windows meldete ihn selbst). Warum, ist offen (im Prozess sind u. a. Steams
+    // CSERHelper.dll und gameoverlayrenderer.dll; bei jedem Start meldet Windows ausserdem c0000409 Code 21 aus KERNELBASE -
+    // "ungueltige Ausnahme-Kette" - ohne Folgen). Darum jetzt zusaetzlich eine Erfassung vor allen Filtern: ein Vectored Exception
+    // Handler (AddVectoredExceptionHandler, als erster; alle 10 s neu vorn, falls sich ein anderer davorlegt) schreibt die ersten
+    // drei Zugriffsfehler/ungueltigen Befehle/Divisionen durch 0 je Sitzung (je Stelle einmal) mit Registern und Ruecksprungen ins
+    // Log - noch bevor entschieden ist, ob jemand sie abfaengt ("erste Stufe"). Er aendert nichts am Ablauf
+    // (EXCEPTION_CONTINUE_SEARCH). Allgemein (Windows).
+    static PVOID CoopVehHandle = NULL;
+    static volatile LONG CoopVehInside = 0;
+    static volatile LONG CoopVehCount = 0;
+    static DWORD CoopVehSeen[3] = { 0, 0, 0 };
+    static long long CoopVehRenewMs = 0;
+
+    static LONG CALLBACK CoopFirstChanceHandler(struct _EXCEPTION_POINTERS* ep) {
+        if (!ep || !ep->ExceptionRecord || !ep->ContextRecord)
+            return EXCEPTION_CONTINUE_SEARCH;
+        const DWORD code = ep->ExceptionRecord->ExceptionCode;
+        if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+            code != EXCEPTION_PRIV_INSTRUCTION)
+            return EXCEPTION_CONTINUE_SEARCH;
+        if (CoopVehCount >= 3)
+            return EXCEPTION_CONTINUE_SEARCH;
+        if (InterlockedIncrement(&CoopVehInside) > 1) {   // Ausnahme beim Schreiben (Stapel lesen) - nicht noch einmal
+            InterlockedDecrement(&CoopVehInside);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        const DWORD eip = ep->ContextRecord->Eip;
+        bool seen = false;
+        for (int i = 0; i < 3; i++)
+            if (CoopVehSeen[i] == eip)
+                seen = true;
+        if (!seen) {
+            const LONG n = InterlockedIncrement(&CoopVehCount) - 1;
+            if (n >= 0 && n < 3) {
+                CoopVehSeen[n] = eip;
+                CoopCrashLog(ep, "Ausnahme (erste Stufe - faengt sie niemand ab, ist es der Absturz):");
+            }
+        }
+        InterlockedDecrement(&CoopVehInside);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    static void CoopVehPulse() {
+        const long long now = GetCurrentMs();
+        if (CoopVehHandle && now - CoopVehRenewMs < 10000)
+            return;
+        CoopVehRenewMs = now;
+        PVOID h = AddVectoredExceptionHandler(1, &CoopFirstChanceHandler);
+        if (CoopVehHandle)
+            RemoveVectoredExceptionHandler(CoopVehHandle);
+        else if (h)
+            OthelloCompatLog("Absturz-Erfassung: Vectored Exception Handler gesetzt (erste Stufe, max. 3 Stellen je Sitzung)");
+        CoopVehHandle = h;
+    }
+
+    void CoopCrashFilterPulse() {
+        CoopVehPulse();
+        LPTOP_LEVEL_EXCEPTION_FILTER cur = SetUnhandledExceptionFilter(&CoopTopCrashFilter);
+        if (cur == &CoopTopCrashFilter || cur == CoopNextCrashFilter)
+            return;
+        CoopNextCrashFilter = cur;
+        static int logged = 0;
+        if (logged++ < 10) {
+            char w[160];
+            CoopCrashWhere((DWORD)cur, w, sizeof(w));
+            OthelloCompatLog("Absturz-Filter: GT liegt vorn, danach %s", cur ? w : "kein weiterer (Windows)");
+        }
+    }
+
     static void __cdecl zCExceptionHandlerUnhandledExceptionFilter(struct _EXCEPTION_POINTERS*);
 #if ENGINE >= Engine_G2
     CInvoke<void(*)(struct _EXCEPTION_POINTERS*)> Ivk_zCExceptionHandlerUnhandledExceptionFilter(0x004C88C0, &zCExceptionHandlerUnhandledExceptionFilter);
@@ -794,6 +1207,7 @@ namespace GOTHIC_ENGINE {
 #endif
     void zCExceptionHandlerUnhandledExceptionFilter(struct _EXCEPTION_POINTERS* pointers) {
         TrackLastExecutedFunctions = false;
+        CoopCrashReport(pointers);   // v101 (A18): zuerst ins Log, Fenster minimieren (einmal - auch aus CoopTopCrashFilter)
 
         HANDLE process;
         process = GetCurrentProcess();

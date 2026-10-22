@@ -33,6 +33,7 @@ namespace GOTHIC_ENGINE {
     // Aus Hooks.cpp / PacketProcessor.cpp / Server.cpp / Plugin.cpp / VisibleNpcsUpdater.cpp / CoopDifficulty.cpp
     bool CoopLeadIsRemote(oCNpc* npc);
     bool CoopLeadIsMine(oCNpc* npc);
+    void CoopNoWhirl(oCNpc* npc);   // v100 (C21, Hooks.cpp): ZS_ATTACK-Neustart ohne Ueberraschungs-Sprung
 
 #if ENGINE == Engine_G1
 
@@ -40,6 +41,7 @@ namespace GOTHIC_ENGINE {
         std::string owner;   // FRIEND_n
         oCNpc* npc;
         long long since;
+        long long lastMs;    // v98: letztes Lebenszeichen des Besitzers (Paket mit "lead" oder "alive")
     };
     struct CoopLeadMineEntry {
         oCNpc* npc;
@@ -47,6 +49,7 @@ namespace GOTHIC_ENGINE {
         long long since;
         long long downSince;   // tot/bewusstlos seit
         long long idleSince;   // ohne Kampfzustand seit
+        long long aliveMs;     // v98: zuletzt "alive" an den Host
     };
     static std::map<std::string, CoopLeadHostEntry> CoopLeadsHost;   // Host: NPC-Name -> fuehrender Client
     static std::map<std::string, long long> CoopLeadCooldown;        // Host: NPC-Name -> nicht vor ... wieder abgeben
@@ -58,6 +61,17 @@ namespace GOTHIC_ENGINE {
     static const float CoopLeadGiveRange = 3000.f;   // Abstand NPC - Figur beim Abgeben
     static const float CoopLeadKeepRange = 4500.f;   // Abstand NPC - eigener Held, bis der Client zurueckgibt
     static const long long CoopLeadHoldMs = 1500;    // so lange mindestens behalten (ausser tot/bewusstlos/weg)
+    // v98 (C18c): Test v97 - der Client lud nach der gemeinsamen Sicherung ("Welt uebernehmen") und vergass dabei seine drei
+    // gefuehrten NPCs (CoopLeadClear "Laden"), ohne es dem Host zu sagen. Der Host hielt sie bis zur Trennung fuer "beim
+    // Client": Kampf-KI aus, eigene Treffer zurueckgesetzt (die Puppe setzte die HP immer wieder auf den letzten Wert vom
+    // Client), Orry lag mit HP 996 bewusstlos und nahm keinen Schaden mehr. Jetzt: beim Vergessen "back"/"take" an den Partner,
+    // der Client meldet jeden gefuehrten NPC jede Sekunde ("alive"), und der Host holt ihn nach 5 s ohne Lebenszeichen zurueck.
+    static const long long CoopLeadAliveMs = 1000;
+    static const long long CoopLeadSilentMs = 5000;
+    // v100: K.o.-Wache (CoopKoWatchPulse, unten)
+    struct CoopKoWatchEntry { oCNpc* npc; std::string name; long long t0; int stage; };
+    static CoopKoWatchEntry CoopKoWatch = { NULL, std::string(), 0, 0 };
+    static bool CoopKoWasDown = false;
 
     static void CoopLeadReadConfig() {
         if (CoopLeadCfgRead)
@@ -194,7 +208,7 @@ namespace GOTHIC_ENGINE {
     // ===== Host =====================================================================================================
 
     static void LeadGive(oCNpc* npc, const std::string& n, const std::string& owner, const std::string& st, float dist) {
-        CoopLeadsHost[n] = { owner, npc, CurrentMs };
+        CoopLeadsHost[n] = { owner, npc, CurrentMs, CurrentMs };
         CoopLeadRemoteSet.insert(npc);
         auto b = BroadcastNpcs.find(string(n.c_str()));
         if (b != BroadcastNpcs.end()) {
@@ -274,6 +288,12 @@ namespace GOTHIC_ENGINE {
             if (IsPlayerTalkingWithNpc(npc) || CoopNpcInDialogWithPlayer(npc)) {
                 auto next = std::next(it);
                 LeadHostReclaim(it, "Host-Held spricht mit ihm", true);
+                it = next;
+                continue;
+            }
+            if (CurrentMs - it->second.lastMs > CoopLeadSilentMs) {   // v98 (C18c)
+                auto next = std::next(it);
+                LeadHostReclaim(it, "seit 5 s kein Lebenszeichen vom Client", true);
                 it = next;
                 continue;
             }
@@ -365,6 +385,7 @@ namespace GOTHIC_ENGINE {
                 if (npc->IsHuman())
                     npc->SetTmpAttitude(NPC_ATT_HOSTILE);
                 npc->SetEnemy(target);
+                CoopNoWhirl(npc);   // v100 (C21)
                 npc->state.StartAIState(zSTRING(LeadAttackState(st.c_str()) ? st.c_str() : (npc->IsHuman() ? "ZS_ATTACK" : "ZS_MM_ATTACK")),
                     FALSE, 0, 0.f, FALSE);
                 how = "Kampf geht beim Host weiter";
@@ -387,6 +408,7 @@ namespace GOTHIC_ENGINE {
         auto it = CoopLeadsHost.find(n);
         if (it == CoopLeadsHost.end() || it->second.owner != sender)
             return false;   // (noch/nicht mehr) nicht von ihm gefuehrt - z. B. letzte Pakete nach der Rueckgabe
+        it->second.lastMs = CurrentMs;   // v98 (C18c)
         j["id"] = n;
         j["lb"] = sender;   // Server.cpp: nicht an den Besitzer zurueck
         return true;
@@ -481,7 +503,7 @@ namespace GOTHIC_ENGINE {
         ln->Reinit();             // Vorbelegung: Lage, HP und Waffenmodus gehen gleich hinaus
         ln->leadSend = true;
         ln->initialized = true;   // kein INIT_NPC (der NPC steht bei allen schon in der Welt)
-        CoopLeadsMine[n] = { npc, ln, CurrentMs, 0, 0 };
+        CoopLeadsMine[n] = { npc, ln, CurrentMs, 0, 0, CurrentMs };
         CoopLeadMineSet.insert(npc);
         // eigene KI: Ziel = eigener Held, Angriffszustand wie beim Host
         npc->GetEM()->KillMessages();
@@ -492,6 +514,7 @@ namespace GOTHIC_ENGINE {
         std::string st = e.contains("st") && e["st"].is_string() ? e["st"].get<std::string>() : std::string();
         if (!LeadAttackState(st.c_str()))
             st = npc->IsHuman() ? "ZS_ATTACK" : "ZS_MM_ATTACK";
+        CoopNoWhirl(npc);   // v100 (C21)
         npc->state.StartAIState(zSTRING(st.c_str()), FALSE, 0, 0.f, FALSE);
         LeadLog("fuehre %s jetzt selbst (%s, %.1f m, HP %d) - KI, Schlaege und Treffer rechnet dieser PC", n.c_str(), st.c_str(),
             (npc->GetPositionWorld() - player->GetPositionWorld()).LengthApprox() / 100.f, npc->GetAttribute(NPC_ATR_HITPOINTS));
@@ -512,6 +535,13 @@ namespace GOTHIC_ENGINE {
         for (auto& kv : CoopLeadsMine) {
             CoopLeadMineEntry& m = kv.second;
             oCNpc* npc = m.npc;
+            if (CurrentMs - m.aliveMs >= CoopLeadAliveMs) {   // v98 (C18c): Lebenszeichen, auch wenn sich nichts bewegt
+                m.aliveMs = CurrentMs;
+                json a;
+                a["op"] = "alive";
+                a["n"] = kv.first;
+                LeadSend(a);
+            }
             if (LeadNpcByName(kv.first) != npc || !LeadInWorld(npc)) {
                 back.push_back({ kv.first, "nicht mehr in der Welt" });
                 continue;
@@ -577,6 +607,12 @@ namespace GOTHIC_ENGINE {
         if (n.empty())
             return;
         if (ServerThread) {
+            if (op == "alive") {   // v98 (C18c)
+                auto it = CoopLeadsHost.find(n);
+                if (it != CoopLeadsHost.end() && it->second.owner == id)
+                    it->second.lastMs = CurrentMs;
+                return;
+            }
             if (op == "back" && !e.contains("by") && player && !IsLoadingLevel)
                 LeadHostBack(e, id, n);
             return;
@@ -608,8 +644,28 @@ namespace GOTHIC_ENGINE {
     // Ladebeginn, Verbindungs-/Host-Ende: alles vergessen (keine Engine-Aufrufe - die Welt kann schon weg sein)
     void CoopLeadClear(const char* why) {
         if (!CoopLeadsHost.empty() || !CoopLeadsMine.empty())
-            OthelloCompatLog("[%lld s, %s] Kampf-Uebergabe: %u abgegebene / %u selbst gefuehrte NPCs vergessen (%s)", DiagSeconds(), DiagRole(),
-                (unsigned)CoopLeadsHost.size(), (unsigned)CoopLeadsMine.size(), why);
+            OthelloCompatLog("[%lld s, %s] Kampf-Uebergabe: %u abgegebene / %u selbst gefuehrte NPCs vergessen (%s) - Partner benachrichtigt",
+                DiagSeconds(), DiagRole(), (unsigned)CoopLeadsHost.size(), (unsigned)CoopLeadsMine.size(), why);
+        // v98 (C18c): dem Partner sagen, dass die Fuehrung endet (nur Pakete - der Host nimmt sie in den Tagesablauf zurueck,
+        // der Client gibt sie ab). Bis v97 erfuhr er es nie und hielt die NPCs bis zur Trennung fest.
+        if (ClientThread && !ServerThread) {
+            for (auto& kv : CoopLeadsMine) {
+                json b;
+                b["op"] = "back";
+                b["n"] = kv.first;
+                b["why"] = why;
+                LeadSend(b);
+            }
+        }
+        else if (ServerThread) {
+            for (auto& kv : CoopLeadsHost) {
+                json t;
+                t["op"] = "take";
+                t["to"] = kv.second.owner;
+                t["n"] = kv.first;
+                LeadSend(t);
+            }
+        }
         for (auto& kv : CoopLeadsMine)
             if (kv.second.local) {
                 kv.second.local->destroyed = true;
@@ -620,6 +676,82 @@ namespace GOTHIC_ENGINE {
         CoopLeadRemoteSet.clear();
         CoopLeadMineSet.clear();
         CoopLeadCooldown.clear();
+        CoopKoWatch.npc = NULL;   // v100: K.o.-Wache (unten)
+        CoopKoWasDown = false;
+    }
+
+    // v100: K.o.-Wache (nur Log). Nutzer (Test v99): "Sarus ist rot, toetet uns aber nicht". Othellos ZS_Attack_End setzt den
+    // Todesstoss (AI_FinishingMove) nur, wenn das letzte Ziel (aivar AIV_LASTTARGET, in ZS_Attack_Loop bei jedem stehenden Ziel neu
+    // gesetzt) im Zustand ZS_Unconscious liegt und die feste Haltung zu ihm feindlich ist; vorher wechselt ZS_Attack_Loop auf das
+    // naechste stehende Ziel (Npc_GetNextTarget - z. B. Goblins oder Molerats in der Naehe). Die Engine (EV_AttackFinish 0x006AC4F9)
+    // verlangt am Opfer den Programmzustand -4. Faellt der eigene Held, wird der naechste NPC, der ihn als Gegner hat, 2 s und 6 s
+    // danach protokolliert: Zustand, Gegner, letztes Ziel, feste Haltung, und am Helden Zustand und IsInState(-4) - damit der
+    // naechste Test zeigt, woran ein ausbleibender Todesstoss liegt. oCNpc_States::IsInState 0x006C4C90, zCPar_Symbol::
+    // GetInstanceAdr 0x006F84C0 (Speicherabbild: unveraendert).
+    static void CoopKoWatchLog(const char* when) {
+        oCNpc* n = CoopKoWatch.npc;
+        if (LeadNpcByName(CoopKoWatch.name) != n) {
+            OthelloCompatLog("[%lld s, %s] K.o.-Wache %s: %s nicht mehr in der Welt", DiagSeconds(), DiagRole(), when, CoopKoWatch.name.c_str());
+            return;
+        }
+        static int aivLast = -2;
+        if (aivLast == -2)
+            aivLast = LeadAivIndex("AIV_LASTTARGET", 39);
+        char last[96] = "-";
+        if (aivLast >= 0 && parser) {
+            const int id = n->aiscriptvars[aivLast];
+            zCPar_Symbol* s = id > 0 ? parser->GetSymbol(id) : NULL;
+            if (s) {
+                oCNpc* t = (oCNpc*)s->GetInstanceAdr();
+                _snprintf(last, sizeof(last), "%s%s", s->name.ToChar(), t == player ? " (=eigener Held)" : (PlayerNpcs.count(t) ? " (=Figur)" : ""));
+                last[sizeof(last) - 1] = 0;
+            }
+        }
+        const std::string en = n->enemy ? (LeadNameOf(n->enemy).empty() ? std::string(n->enemy->GetObjectName().ToChar()) : LeadNameOf(n->enemy)) : std::string("-");
+        OthelloCompatLog("[%lld s, %s] K.o.-Wache %s: %s Zustand=%s Gegner=%s letztes Ziel=%s feste Haltung zu mir=%d%s | eigener Held: %s, "
+            "Zustand %s (%d), IsInState(-4)=%d, HP %d", DiagSeconds(), DiagRole(), when, CoopKoWatch.name.c_str(),
+            n->state.curState.name.ToChar(), en.c_str(), last, n->GetPermAttitude(player),
+            CoopLeadIsMine(n) ? " (selbst gefuehrt)" : (CoopLeadIsRemote(n) ? " (fuehrt ein Client)" : ""),
+            player->IsDead() ? "tot" : (player->IsUnconscious() ? "bewusstlos" : "steht"), player->state.curState.name.ToChar(),
+            player->state.curState.index, player->state.IsInState(-4), player->GetAttribute(NPC_ATR_HITPOINTS));
+    }
+
+    // DamageProcessorLoop (Host und Client), jedes Bild
+    void CoopKoWatchPulse() {
+        if ((!ServerThread && !ClientThread) || !player || IsLoadingLevel || WorldEditMode)
+            return;
+        const bool down = player->IsUnconscious() != 0 && !player->IsDead();
+        if (down && !CoopKoWasDown) {
+            oCNpc* best = NULL;
+            float bestDist = 1000.f;
+            for (auto& kv : NpcToUniqueNameList) {
+                oCNpc* n = kv.first;
+                if (!n || n == player || PlayerNpcs.count(n) || n->enemy != player || n->IsDead() || n->IsUnconscious())
+                    continue;
+                const float d = (n->GetPositionWorld() - player->GetPositionWorld()).LengthApprox();
+                if (d < bestDist) {
+                    bestDist = d;
+                    best = n;
+                }
+            }
+            if (best) {
+                CoopKoWatch = { best, LeadNameOf(best), CurrentMs, 0 };
+                if (CoopKoWatch.name.empty())
+                    CoopKoWatch.npc = NULL;
+            }
+        }
+        CoopKoWasDown = down;
+        if (!CoopKoWatch.npc)
+            return;
+        const long long dt = CurrentMs - CoopKoWatch.t0;
+        if (CoopKoWatch.stage == 0 && dt >= 2000) {
+            CoopKoWatchLog("nach 2 s");
+            CoopKoWatch.stage = 1;
+        }
+        else if (CoopKoWatch.stage == 1 && dt >= 6000) {
+            CoopKoWatchLog("nach 6 s");
+            CoopKoWatch.npc = NULL;
+        }
     }
 
     // fuer die Netzzeile alle 30 s (CoopDiag.cpp)
@@ -641,6 +773,7 @@ namespace GOTHIC_ENGINE {
     void CoopLeadReceive(json&, const std::string&) {}
     void CoopLeadPulse() {}
     void CoopLeadClear(const char*) {}
+    void CoopKoWatchPulse() {}
     void CoopLeadDiag(std::string& out) { out.clear(); }
 #endif
 }

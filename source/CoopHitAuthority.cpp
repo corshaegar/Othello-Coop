@@ -30,6 +30,8 @@ namespace GOTHIC_ENGINE {
     //   Umstehende beim Host die Kaempfe des Clients nie.
     // Konfiguration: coopClientHitAuthority (true), coopHitReachExtraCm (150), coopHitAngleDeg (75), coopHitRangedMaxCm (5000).
 
+    void CoopNoWhirl(oCNpc* npc);   // v100 (C21, Hooks.cpp): ZS_ATTACK-Neustart ohne Ueberraschungs-Sprung
+
 #if ENGINE == Engine_G1
 
     static bool CoopHitCfgRead = false;
@@ -125,6 +127,17 @@ namespace GOTHIC_ENGINE {
         OthelloCompatLog("[%lld s, %s] Bestrafung: %s", DiagSeconds(), DiagRole(), buf);
     }
 
+    // v100 (C13b): Nutzer (Test v99): "Sarus ist rot, toetet uns aber nicht". Log Host: nach INFO_SARUS_GOAWAY (Othello:
+    // Npc_SetPermAttitude(self, ATT_HOSTILE), Angriff auf den Helden) schlug FRIEND_2 ihn staendig - Sarus war also vorgemerkt.
+    // 819 s lenkte die Umlenkung seinen Angriff auf die Figur, 862 s und 915 s schickte sie ihn "zurueck in den Tagesablauf", weil
+    // die Figur lag - mitten im eigenen Kampf gegen den Host-Helden. Wer dem Host-Helden selbst dauerhaft feindlich ist (feste
+    // Haltung zum Spieler, z. B. nach so einem Dialog oder eine feindliche Gilde), greift ihn aus eigenem Grund an - das ist keine
+    // Bestrafung fuer die Tat des Clients. Solche NPCs werden nicht vorgemerkt und nicht umgelenkt. GetPermAttitude 0x0068D3C0
+    // (Hooks.cpp: unveraendert, liest bei Othello das verlegte Gildenfeld).
+    static bool CoopPunishOwnGrudge(oCNpc* npc) {
+        return player && npc->GetPermAttitude(player) == NPC_ATT_HOSTILE;
+    }
+
     static bool CoopPunishFightsHost(oCNpc* npc) {
         return npc->enemy == player && strcmp(npc->state.curState.name.ToChar(), "ZS_ATTACK") == 0;
     }
@@ -136,7 +149,7 @@ namespace GOTHIC_ENGINE {
         if (it == NpcToUniqueNameList.end())
             return false;
         const std::string key(it->second.ToChar());
-        if (CoopPunishFightsHost(npc)) {   // kaempft schon mit dem Host-Helden - bleibt dabei
+        if (CoopPunishFightsHost(npc) || CoopPunishOwnGrudge(npc)) {   // kaempft schon mit dem Host-Helden / ist ihm selbst feind - bleibt dabei
             CoopPunishMarks.erase(key);
             return false;
         }
@@ -207,6 +220,12 @@ namespace GOTHIC_ENGINE {
                 ++it;
                 continue;
             }
+            if (CoopPunishOwnGrudge(npc)) {   // v100 (C13b): Haltung erst nach dem Vormerken feindlich geworden (Dialog)
+                PunishLog("%s greift den Host-Helden an (%s) - ihm selbst feindlich (feste Haltung), keine Bestrafung: bleibt dabei",
+                    it->first.c_str(), st.c_str());
+                it = CoopPunishMarks.erase(it);
+                continue;
+            }
             it->second.holdUntil = CurrentMs + 1000;
             const std::string fig = CoopHitNpcName(figure);
             if (figure->IsDead() || figure->IsUnconscious()) {
@@ -220,6 +239,7 @@ namespace GOTHIC_ENGINE {
             if (punish) {
                 npc->ClearEM();
                 npc->SetEnemy(figure);
+                CoopNoWhirl(npc);   // v100 (C21)
                 npc->state.StartAIState(zSTRING("ZS_ATTACK"), FALSE, 0, 0.f, FALSE);
             }
             else
@@ -576,7 +596,16 @@ namespace GOTHIC_ENGINE {
         wasDown = down;
     }
 
+    // v98 (A16): Ladebeginn (Plugin.cpp) - Bestrafungs-Merker gelten fuer NPCs der alten Welt (nach dem Laden gleiche Namen,
+    // andere Geschichte), Schlag-Erlaubnisse und -Ergebnisse halten Zeiger auf NPCs der alten Welt
+    void CoopHitWorldGone() {
+        CoopPunishMarks.clear();
+        CoopSwingPermits.clear();
+        CoopSwingPendings.clear();
+    }
+
 #else
+    void CoopHitWorldGone() {}
     bool CoopClientHitAuthority() { return false; }
     void CoopSwingReport(oCNpc*, oCNpc*, oCNpc::oSDamageDescriptor&) {}
     void CoopFightSound(oCNpc*, oCNpc*) {}

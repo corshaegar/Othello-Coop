@@ -50,6 +50,12 @@ namespace GOTHIC_ENGINE {
         CoopPendingHits.push_back(hit);
     }
 
+    // v98 (A16): Ladebeginn (Plugin.cpp) - Treffer des letzten Bilds vor dem Laden nicht in der neuen Welt messen
+    void CoopDamageWorldGone() {
+        CoopPendingHits.clear();
+        memset(CoopDamageStarts, 0, sizeof(CoopDamageStarts));
+    }
+
     static bool CoopDamageNpcAlive(oCNpc* n) {
         return n && (n == player || PlayerNpcs.count(n) > 0 || NpcToUniqueNameList.count(n) > 0);
     }

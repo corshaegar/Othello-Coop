@@ -75,6 +75,10 @@ namespace GOTHIC_ENGINE {
     static bool MouseUserSel = false;
     static int MouseUserSelLogged = 0;
     static unsigned MouseSelectSeq = 0;    // v93: jede Markierung durch die Maus (Liste "Spielstand waehlen": kein Blaettern)
+    // v99 (H27c): Tagebuch - siehe MouseListWatch
+    static bool MouseSwallowLeft = false;     // nach einem Klick, den GT umsetzt: Gothics Linksklick aus, bis der Knopf los ist
+    static zCMenuItem* MouseListRun = NULL;   // Themenliste, deren Schleife (zCMenuItemList::Run) laeuft
+    static DWORD MouseListLostSince = 0;      // seit wann sie weder oben liegt noch ein Thema offen ist
 
     unsigned CoopMenuMouseSelectSeq() {
         return MouseSelectSeq;
@@ -324,15 +328,68 @@ namespace GOTHIC_ENGINE {
     // Jetzt: Liste oben -> Gothics Links-Code aus, Linksklick = RETURN (zeigt das markierte Thema). Die Zeilen zeichnet zUtilities
     // (vtable 0x007D2BE8 +0x34 DrawFront -> ZUTILITIES), darum kein Markieren unter dem Zeiger - waehlen per Rad/Pfeiltasten.
     // Allgemein G1 (Gothics Liste); zUtilities nur Othello.
-    static zCMenuItem* MouseRunningList(zCMenu* menu, zCInputCallback* top) {
+    static zCMenuItem* MouseRunningItem(zCMenu* menu, zCInputCallback* top, int type) {
         if (!menu || !top)
             return NULL;
         for (int i = 0; i < menu->m_listItems.GetNum(); i++) {
             zCMenuItem* it = menu->m_listItems[i];
-            if (it && it->m_parType == MENU_ITEM_LISTBOX && static_cast<zCInputCallback*>(it) == top)
+            if (it && it->m_parType == type && static_cast<zCInputCallback*>(it) == top)
                 return it;
         }
         return NULL;
+    }
+
+    static zCMenuItem* MouseRunningList(zCMenu* menu, zCInputCallback* top) {
+        return MouseRunningItem(menu, top, MENU_ITEM_LISTBOX);
+    }
+
+    // v99 (H27c): Test v98 (Host): "Man kann nicht den Eintrag anklicken, und sobald man Esc drueckt, kommt man nicht mehr aus dem
+    // Tagebuch raus". Log: Klick auf die Themenliste -> RETURN -> Thema offen (zCMenuItemText, vtable 007D2DF8) -> im selben Moment
+    // oben wieder das Menue (oCMenu_Log 007D1FD4), nicht die Liste; danach 45 s nur Klicks auf MENU_ITEM_SEL_MISSIONS_ACT ohne
+    // Wirkung. Beim Mitspieler ging es meist (Thema -> Liste -> Menue). Engine (Speicherabbild): zCMenuItemList::Run (0x004D8B50,
+    // unveraendert) meldet die Liste an (SetEnableHandleEvent 0x006FB8F0), setzt m_bLeaveItem (+0x374) = 0 und dreht HandleFrame,
+    // bis m_bLeaveItem gesetzt ist - das setzt nur ihr HandleEvent (0x004D9640: ESC/0x804; RETURN/0x802 -> ShowContent, unter
+    // Othello an ZUTILITIES.DLL+0x24FB0). Verliert die Liste die Anmeldung, laufen alle Tasten ins Menue: Esc setzt dessen
+    // m_exitState, das in der Schleife der Liste niemand prueft - man kommt nicht mehr heraus. Wer sie abmeldet: zUtilities beim
+    // Schliessen des Themas (Gothics eigenes ShowContent meldet nichts an oder ab). Jetzt: (1) nach einem Klick bleibt Gothics
+    // Linksklick aus, bis der Knopf los ist (der gehaltene Knopf schloss das gerade geoeffnete Thema); (2) Thema offen: Linksklick
+    // = ESCAPE (der Tastaturweg schliesst es), Gothics 0x802 aus; (3) laeuft die Liste ohne Anmeldung und ohne offenes Thema
+    // 300 ms weiter, wird sie wieder vorn angemeldet (SetEnableHandleEvent 0 und 1 - mit 1 allein bliebe sie, wo sie ist).
+    // Allgemein G1 (Gothics Liste) + nur Othello (zUtilities).
+    static void MouseListWatch(zCMenu* menu, zCInputCallback* top, zCMenuItem* runList, zCMenuItem* runText) {
+        if (runList) {
+            MouseListRun = runList;
+            MouseListLostSince = 0;
+            return;
+        }
+        zCMenuItem* l = MouseListRun;
+        if (!l)
+            return;
+        bool inMenu = false;
+        for (int i = 0; i < menu->m_listItems.GetNum() && !inMenu; i++)
+            inMenu = menu->m_listItems[i] == l;
+        if (!inMenu || l->m_bLeaveItem) {   // anderes Menue oder Schleife regulaer zu Ende
+            MouseListRun = NULL;
+            MouseListLostSince = 0;
+            return;
+        }
+        if (runText) {   // Thema offen - die Liste wartet zu Recht
+            MouseListLostSince = 0;
+            return;
+        }
+        if (!MouseListLostSince) {
+            MouseListLostSince = MouseMenuTick ? MouseMenuTick : 1;
+            return;
+        }
+        if (MouseMenuTick - MouseListLostSince < 300)
+            return;
+        zCInputCallback* cb = static_cast<zCInputCallback*>(l);
+        const int had = cb->GetEnableHandleEvent();
+        cb->SetEnableHandleEvent(0);
+        cb->SetEnableHandleEvent(1);
+        MouseListLostSince = 0;
+        MouseLog("Tagebuch: Themenliste %s lief ohne Eingabe weiter (oben %p, vtable %08X, angemeldet %d) - wieder vorn angemeldet",
+            l->id.ToChar(), (void*)top, top ? *(DWORD*)top : 0, had);
     }
 
     static void MouseLogMenu(zCMenu* menu, int cw, int ch) {
@@ -394,6 +451,8 @@ namespace GOTHIC_ENGINE {
     void CoopMenuMouseHide() {
         MouseMenuOn = false;
         MouseSelMenu = NULL;   // v86: naechstes Menue (auch an derselben Adresse) beginnt ohne eigene Wahl
+        MouseListRun = NULL;   // v99: ohne Menue laeuft keine Themenliste
+        MouseListLostSince = 0;
         if (MouseView && MouseView->ondesk && MouseView->owner) {
             MouseView->owner->RemoveItem(MouseView);
             MouseFixScreenLast();   // v63
@@ -463,23 +522,30 @@ namespace GOTHIC_ENGINE {
         const bool menuOnTop = menu->m_listItems.GetNum() > 0 && (top == static_cast<zCInputCallback*>(menu) ||
             (activeItem && top == static_cast<zCInputCallback*>(activeItem)));
         zCMenuItem* runList = menuOnTop ? NULL : MouseRunningList(menu, top);   // v92: Themenliste (Tagebuch) laeuft
+        zCMenuItem* runText = (menuOnTop || runList) ? NULL : MouseRunningItem(menu, top, MENU_ITEM_TEXT);   // v99: Thema offen
+        MouseListWatch(menu, top, runList, runText);   // v99 (H27c)
         if (menuOnTop != MouseMenuOnTopWas || top != MouseTopWas) {
-            if (MouseTopLogged < 40) {   // v92: 40 statt 20 (Test v91: Grenze vor dem Tagebuch erreicht)
+            if (MouseTopLogged < 80) {   // v92: 40 statt 20 (Test v91: Grenze vor dem Tagebuch erreicht); v99: 80
                 MouseTopLogged++;
                 MouseLog("Eingabe oben: %p (vtable %08X) - %s", (void*)top, top ? *(DWORD*)top : 0,
                     menuOnTop ? "Men" COOP_UE " selbst, GT steuert Klicks" : runList ? "Liste im Men" COOP_UE " (Tagebuch), Linksklick = RETURN"
+                    : runText ? "Thema offen (Tagebuch), Linksklick = Esc"
                     : "NICHT das Men" COOP_UE " - Gothics Klicks gehen an diesen Empf" COOP_AE "nger");
             }
             MouseMenuOnTopWas = menuOnTop;
             MouseTopWas = top;
         }
-        if (menuOnTop || runList) {
+        const bool left = *(volatile int*)0x0086CCB8 != 0;
+        if (!left)
+            MouseSwallowLeft = false;
+        if (menuOnTop || runList || runText || MouseSwallowLeft) {   // v99: auch nach eigenem Klick, bis der Knopf los ist
             *(volatile int*)0x008DE1B0 = 1;
             *(volatile int*)0x0086CCC0 = 0;
         }
-        const bool left = *(volatile int*)0x0086CCB8 != 0;
-        const bool click = left && !MouseLeftWas && (menuOnTop || runList);
+        const bool click = left && !MouseLeftWas && (menuOnTop || runList || runText);
         MouseLeftWas = left;
+        if (click)
+            MouseSwallowLeft = true;
 
         // v58: Fenster vorn auch, wenn das Vordergrundfenster ein Eltern-/Besitzerfenster von hWndApp ist (Renderer-Fenster);
         // ohne Fenster-Handle das von zCInput (GetKey vergleicht GetFocus mit 0x0086D30C)
@@ -555,6 +621,17 @@ namespace GOTHIC_ENGINE {
                 if (MouseClicksLogged < 80) {
                     MouseClicksLogged++;
                     MouseLog("Klick in %s auf die Liste %s -> RETURN (Thema anzeigen)", menu->name.ToChar(), runList->id.ToChar());
+                }
+            }
+            return;
+        }
+        // v99 (H27c): Thema offen - Linksklick schliesst es wie Esc (Tastaturweg); Gothics 0x802 bleibt aus
+        if (runText) {
+            if (click) {
+                MousePushKey(0x01);   // ESCAPE
+                if (MouseClicksLogged < 80) {
+                    MouseClicksLogged++;
+                    MouseLog("Klick in %s auf das Thema %s -> Esc (Thema schlie" "\xDF" "en)", menu->name.ToChar(), runText->id.ToChar());
                 }
             }
             return;

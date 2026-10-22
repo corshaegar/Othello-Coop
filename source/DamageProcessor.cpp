@@ -4,6 +4,7 @@ namespace GOTHIC_ENGINE {
         CoopDamageFinalizePending();   // Treffer aus dem letzten Durchlauf endgueltig messen
         CoopSwingPulse();              // v53: Ergebnisse bestaetigter NPC-Schlaege an den Host (CoopHitAuthority.cpp)
         CoopPunishPulse();             // v54: Bestrafung wegen eines Client-Treffers geht auf dessen Figur (CoopHitAuthority.cpp)
+        CoopKoWatchPulse();            // v100: K.o.-Wache - kommt der Todesstoss? (nur Log, CoopCombatLead.cpp)
 
         if (ReadyToSyncDamages.isEmpty()) {
             return;

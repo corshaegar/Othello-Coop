@@ -1353,7 +1353,8 @@ namespace GOTHIC_ENGINE {
             w->traceRayReport.foundHit);
     }
 
-    static bool CoopPlaceBesideHost(const zVEC3& host, const zVEC3& hostAt, std::string& how) {
+    // v102: whom - fuer die Meldung (Teleport-Rune, CoopTeleport.cpp: "den Mitspieler")
+    static bool CoopPlaceBesideHost(const zVEC3& host, const zVEC3& hostAt, std::string& how, const char* whom = "den Helden des Stands") {
         zCWorld* w = ogame ? ogame->GetGameWorld() : NULL;
         if (!w || !player) {
             how = "keine Welt - Lage unveraendert";
@@ -1394,14 +1395,14 @@ namespace GOTHIC_ENGINE {
                 player->SetCollDet(TRUE);
                 player->SetHeadingAtWorld(zVEC3(ax, 0.f, az));
                 char b[200];
-                _snprintf(b, sizeof(b), "neben den Helden des Stands gesetzt (%.1f m, Richtung %d Grad, %d. Stelle, %.0f/%.0f/%.0f)",
-                    dist / 100.f, (int)ang, tried, p.n[0], p.n[1], p.n[2]);
+                _snprintf(b, sizeof(b), "neben %s gesetzt (%.1f m, Richtung %d Grad, %d. Stelle, %.0f/%.0f/%.0f)",
+                    whom, dist / 100.f, (int)ang, tried, p.n[0], p.n[1], p.n[2]);
                 b[sizeof(b) - 1] = 0;
                 how = b;
                 return true;
             }
         }
-        how = std::string("keine legale Stelle neben dem Helden des Stands (zuletzt: ") + lastWhy + ") - Lage unveraendert";
+        how = std::string("keine legale Stelle neben ") + whom + " (zuletzt: " + lastWhy + ") - Lage unveraendert";
         return false;
     }
 
@@ -1559,8 +1560,15 @@ namespace GOTHIC_ENGINE {
     // (oCInformationManager::Exit wie der Dialog-Waechter) und laedt 0,7 s spaeter (Kamera zurueck). Allgemein.
     static long long CoopLoadDialogWaitMs = 0;
     static long long CoopLoadDialogExitMs = 0;
+    // v101 (Durchsicht v90): ein Ladevorgang, der waehrend des Wartens wegfiel (Verbindung weg, Auftrag ueberholt), liess die
+    // Zeiten stehen - der naechste Ladevorgang in einem Dialog haette ihn sofort beendet statt 15 s zu warten. Jeder Ladevorgang
+    // fragt hier in jedem Bild; laenger als 2 s keine Frage = neuer Ladevorgang, Zeiten zuruecksetzen.
+    static long long CoopLoadBlockAskMs = 0;
 
     static bool CoopLoadBlockedByMenu(const char* what) {
+        if (CurrentMs - CoopLoadBlockAskMs > 2000)
+            CoopLoadMenuWaitMs = CoopLoadDialogWaitMs = CoopLoadDialogExitMs = 0;
+        CoopLoadBlockAskMs = CurrentMs;
         zCMenu* menu = player ? zCMenu::GetActive() : NULL;
         if (!menu) {
             if (CoopLoadMenuWaitMs) {

@@ -606,6 +606,31 @@ namespace GOTHIC_ENGINE {
             if (ServerThread)
                 DiffNextSendMs = 0;   // gleich senden
         }
+        // v98 (H34): Test v97 - beim Host standen Tagebuch und Gegenstaende/Truhen seit v95 auf "aus" (zwei Klicks im Abgleich-Menue,
+        // der erste ueber H27 mit dem Zeiger im Leeren); aufgefallen ist es erst, als ein vom Client aufgehobenes Schwert beim Host
+        // liegen blieb. Die Abgleich-Zeile oben kommt beim Verbinden aus dem Hauptmenue nie (noch kein Held, danach keine Aenderung).
+        // Jetzt im Coop einmal je Verbindung und nach jeder Aenderung, sobald ein Held da ist: was nicht abgeglichen wird.
+        static int syncWarnKey = -1;
+        if (!on)
+            syncWarnKey = -1;
+        else if (player && !IsLoadingLevel && !(ClientThread && !ServerThread && !DiffHostValid)) {
+            const int key = (eff.sq ? 1 : 0) | (eff.sl ? 2 : 0) | (eff.sw ? 4 : 0);
+            if (key != syncWarnKey) {
+                syncWarnKey = key;
+                if (key) {
+                    std::string off;
+                    if (eff.sq)
+                        off += CoopTr("Quests", "quests");
+                    if (eff.sl)
+                        off += std::string(off.empty() ? "" : ", ") + CoopTr("Tagebuch", "diary");
+                    if (eff.sw)
+                        off += std::string(off.empty() ? "" : ", ") + CoopTr("Gegenst" COOP_AE "nde/Truhen", "items/chests");
+                    ChatLog(string::Combine(CoopTr("Achtung: nicht abgeglichen wird: %s (Host: Einstellungen > COOP > Abgleich)",
+                        "Note: not synchronized: %s (host: Settings > COOP > Sync)"), string(off.c_str())), zCOLOR(255, 190, 0, 255));
+                    OthelloCompatLog("[%lld s, %s] Abgleich: Hinweis im Chat - nicht abgeglichen: %s", DiagSeconds(), DiagRole(), off.c_str());
+                }
+            }
+        }
         if (ServerThread && now >= DiffNextSendMs) {
             DiffNextSendMs = now + 5000;
             DiffSend();

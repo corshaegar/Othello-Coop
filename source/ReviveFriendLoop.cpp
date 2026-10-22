@@ -21,7 +21,8 @@ namespace GOTHIC_ENGINE {
                 return;
             }
 
-            Myself->SyncRevived(ReviveNpc->GetObjectName());
+            if (ReviveNpc && Myself)   // v98 (A16): vorher ohne Pruefung vor dem if unten
+                Myself->SyncRevived(ReviveNpc->GetObjectName());
 
             if (ReviveNpc) {
                 ReviveNpc->StopFaceAni("T_HURT");

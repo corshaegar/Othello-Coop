@@ -329,6 +329,10 @@ namespace GOTHIC_ENGINE {
 
         PluginState = "FarSync";
         CoopFarSyncPulse();   // v41: Todesabgleich ausserhalb der Reichweite, Bericht zum Verfolgungspunkt
+        PluginState = "Teleport";
+        CoopTeleportPulse();  // v102: Teleport-Rune (Ziel Mitspieler, Startausstattung)
+        PluginState = "PartnerMarker";
+        CoopPartnerMarkerPulse();   // v104: Name ueber dem Kopf / Pfeil am Bildrand / Marke auf Othellos Karte
         PluginState = "Camera";
         CoopCamPulse();       // v48: Zuschau-Fenster (Kamera je Bild, Automatik ausserhalb des Radius)
         PluginState = "Look";
@@ -518,6 +522,19 @@ namespace GOTHIC_ENGINE {
         CoopCamStop("Laden");   // v44/v48: noch vor IsLoadingLevel - Zuschau-Fenster aus, Automatik neu
         CoopDiffHpWorldGone();  // v70: gemerkte NPC-Zeiger der alten Welt verwerfen
         CoopLeadClear("Laden"); // v72: Kampf-Uebergaben der alten Welt vergessen
+        // v98 (A16): alles mit Zeigern in die alte Welt verwerfen - nach dem Laden gilt nur der Spielstand (Nutzer: "beim Laden sollte
+        // genau der Zustand des Spiels uebergeben werden, das heisst unsere Coop sollte auch auf dem Stand sein")
+        CoopDamageWorldGone();       // Treffer des letzten Bilds (CoopDamage.cpp)
+        CoopHitWorldGone();          // Bestrafungs-Merker, Schlag-Erlaubnisse/-Ergebnisse (CoopHitAuthority.cpp)
+        CoopFigureHitsWorldGone();   // C20-Merker (Hooks.cpp)
+        CoopPartnerMarkerWorldGone(); // v104: Sicht-Merker je Figur (CoopPartnerMarker.cpp)
+        while (!ReadyToSyncDamages.isEmpty())
+            ReadyToSyncDamages.dequeue();
+        while (!ReadyToSyncSpellCasts.isEmpty())
+            ReadyToSyncSpellCasts.dequeue();
+        ReviveState = "READY";       // Wiederbeleben (ReviveFriendLoop.cpp) zeigte sonst auf die Figur der alten Welt
+        ReviveNpc = NULL;
+        ReviveStartTime = 0;
         IsLoadingLevel = true;
         Myself = NULL;
     }
@@ -553,6 +570,7 @@ namespace GOTHIC_ENGINE {
         CoopSaveSyncWorldLoaded();    // v19: Zeitpunkt fuer das Wiederherstellen des eigenen Helden
         CoopDialogSyncWorldLoaded();  // v26: Dialog-Sperren der alten Welt verwerfen
         CoopFarSyncWorldLoaded();     // v41: Todesliste/Vergleichsstand der alten Welt verwerfen
+        CoopTeleportLoadEnd();        // v102: Teleport-Rune - nach dem Laden pruefen, ob sie im Inventar ist
 
         auto totWp = ogame->GetWorld()->wayNet->GetWaypoint("TOT");
         if (totWp) {
