@@ -144,6 +144,7 @@ namespace GOTHIC_ENGINE {
         {
             auto player = (PeerData*)packet.peer->data;
             if (player == NULL) {   // Peer ohne zugeordnete Daten: Paket verwerfen statt abstuerzen
+                enet_packet_destroy(packet.packet);   // v97 (A11)
                 break;
             }
             auto dataLenght = packet.packet->dataLength;
@@ -153,6 +154,11 @@ namespace GOTHIC_ENGINE {
             for (int i = 0; i < dataLenght; i++) {
                 bytesVector.push_back(data[i]);
             }
+            // v97 (A11): Der Host gab empfangene ENet-Pakete nie frei (der Client schon, ProcessClientPacket) - jedes Paket eines
+            // Mitspielers blieb samt Daten im Speicher, auch jede hochgeladene Spielstanddatei. Die Daten sind kopiert, danach
+            // liest niemand mehr packet.packet (ProcessCoopPacket nimmt nur packet.peer). Upstream: Gothic-Workshop 0116d61.
+            enet_packet_destroy(packet.packet);
+            packet.packet = NULL;
 
             auto j = json::from_bson(bytesVector);
             j["id"] = player->name.ToChar();

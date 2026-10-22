@@ -35,7 +35,7 @@ namespace GOTHIC_ENGINE {
     // beginnt. Jeder Log-Schreiber ruft CoopLogArchiveOnce() vor seinem ersten fopen. Danach steht die Fassung im neuen Log.
     // Nur Windows-Aufrufe, keine Engine-Stelle.
 
-#define COOP_OTHELLO_FASSUNG "v96"
+#define COOP_OTHELLO_FASSUNG "v97"
 
     // --- v95: Sprache der Coop-Anzeigen ----------------------------------------------------------
     // Nutzer: "dass man die Sprache der Coop-Einstellungen und Anzeigen auf Englisch stellen kann". Gothic.ini [GOTHICCOOP]

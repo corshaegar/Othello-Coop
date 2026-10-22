@@ -37,13 +37,16 @@ namespace GOTHIC_ENGINE {
             return val;
         }
 
+        // v97 (A13): auch Lesen unter der Sperre - die Netzfaeden reihen gleichzeitig ein (Upstream: Gothic-Workshop 6205a6b)
         bool isEmpty()
         {
+            std::lock_guard<std::mutex> lock(m);
             return q.empty();
         }
 
         int size()
         {
+            std::lock_guard<std::mutex> lock(m);
             return q.size();
         }
 

@@ -838,7 +838,10 @@ namespace GOTHIC_ENGINE {
             }
         }
 
-        std::vector<std::string> last10CoreMethodCalls(lastCoreMethodCalls.end() - 10, lastCoreMethodCalls.end());
+        // v97 (A12): wie A1 in Debugger.cpp - unter Othello bleibt die Liste leer, end() - 10 war dann ein ungueltiger Zeiger und
+        // der Absturz-Haken stuerzte selbst ab, bevor er die Meldung zeigen konnte. Upstream: Gothic-Workshop a05c6b6.
+        const size_t coreCallCount = lastCoreMethodCalls.size() < 10 ? lastCoreMethodCalls.size() : 10;
+        std::vector<std::string> last10CoreMethodCalls(lastCoreMethodCalls.end() - coreCallCount, lastCoreMethodCalls.end());
         std::string errorMessage = "[" + CoopVersionName() + ", " + CoopBuildStamp() + "] Fehler:\n";   // v58: Fassung statt COOP_VERSION
         std::string errorLog = "";
 

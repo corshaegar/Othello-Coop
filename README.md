@@ -5,8 +5,14 @@ Grundlage ist [Gothic Together / GothicCoop](https://gitlab.com/gothiccoop/gothi
 
 *English below.*
 
-> **Alpha (Version 0.1.0).** Getestet mit zwei Spielern (Host + ein Mitspieler) und der deutschen Othello-Fassung.
+> **Alpha (Version 0.1.1).** Getestet mit zwei Spielern (Host + ein Mitspieler) und der deutschen Othello-Fassung.
 > Vorher die Spielstände sichern.
+
+## Versionen
+
+- **0.1.1** – Speicherleck beim Host behoben (wuchs mit der Spielzeit), Absturzmeldung stürzt nicht mehr selbst ab, stabilere
+  Netz-Warteschlange, kein Absturz mehr beim Zauberwechsel des Mitspielers.
+- **0.1.0** – erste Fassung.
 
 ## Was geht
 
@@ -89,8 +95,9 @@ THQ Nordic oder dem Othello-Team.
 ## English
 
 Co-op mode for **Gothic 1** with the **Othello 4.4.2.1** mod, based on
-[Gothic Together / GothicCoop](https://gitlab.com/gothiccoop/gothiccoop) (Union plugin). **Alpha** (version 0.1.0),
-tested with two players and the German Othello release. Back up your saves first.
+[Gothic Together / GothicCoop](https://gitlab.com/gothiccoop/gothiccoop) (Union plugin). **Alpha** (version 0.1.1),
+tested with two players and the German Othello release. Back up your saves first. 0.1.1 fixes a memory leak on the host,
+a crash in the crash reporter, a network queue race and a possible crash when the partner switches spells.
 
 **Features:** the host runs the world (chests, items, corpses, spawns, NPC routines); shared story (dialogues,
 quests, diary, chapters, quest XP); NPCs fight both players, combat handled by the fighting player's PC; adjustable

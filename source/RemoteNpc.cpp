@@ -598,8 +598,10 @@ namespace GOTHIC_ENGINE {
                     auto selectedSpell = book->GetSelectedSpell();
                     if (selectedSpell) {
                         auto selectedSpellItem = book->GetSpellItem(selectedSpell);
-                        npc->DoDropVob(selectedSpellItem);
-                        selectedSpellItem->RemoveVobFromWorld();
+                        if (selectedSpellItem) {   // v97 (A14): kann NULL sein (Upstream: Gothic-Workshop 0a5bb2f)
+                            npc->DoDropVob(selectedSpellItem);
+                            selectedSpellItem->RemoveVobFromWorld();
+                        }
                         selectedSpell->Kill();
                     }
 
