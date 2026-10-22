@@ -22,8 +22,8 @@ Grundlage ist [Gothic Together / GothicCoop](https://gitlab.com/gothiccoop/gothi
 - Gothic 1 mit **Othello 4.4.2.1** (bringt Union und zParserExtender mit)
 - GD3D11-Renderer – die ZIP ersetzt `system\GD3D11\Bin\g1_avx2.dll` durch eine Coop-Fassung
 - **Alle Spieler brauchen dieselbe Version.**
-- Verbindung per IP: Der Host gibt **UDP-Port 9955** frei (im Menü änderbar). Per Steam: befreundete Konten, die
-  Gothic besitzen; das Spiel muss beim Beitreten schon laufen.
+- Verbindung per IP: Der Host gibt **UDP-Port 9955** frei (im Menü änderbar). Per Steam: Steam-Fassung von Gothic
+  (`system\steam_api.dll`), befreundete Konten; das Spiel muss beim Beitreten schon laufen.
 
 ## Installation
 
@@ -40,7 +40,7 @@ Inhalt der ZIP:
 | `system\Autorun\Gothic1Coop.dll` | das Coop-Plugin |
 | `system\Autorun\COOP_MENU.D`, `PC_MULTIPLAYER_HERO.D` | COOP-Menü und Mitspieler-Figur |
 | `system\GD3D11\Bin\g1_avx2.dll` | Renderer mit Zuschau-Fenster und Figur-Vorschau |
-| `GothicCoop-Lizenzen\` | Lizenztexte und Herkunft |
+| `system\GothicCoopConfig.json` | Grundeinstellungen (Pflicht; Name und Adresse stellt man danach im COOP-Menü ein) |
 
 ## Spielen
 
@@ -58,7 +58,8 @@ Unter *COOP-Einstellungen* (auch *Einstellungen → COOP*) liegen Sprache, Schwi
 
 ## Quellcode bauen
 
-`source\` ist der vollständige Quellcode der DLL in dieser Version, `scripts\` die beiden `.D`-Dateien.
+`source\` ist der vollständige Quellcode der DLL in dieser Version, `scripts\` enthält die beiden `.D`-Dateien und die
+Standard-`GothicCoopConfig.json`.
 Bauen mit den Visual Studio 2019 Build Tools:
 
 ```
@@ -97,7 +98,8 @@ difficulty; shared saves and a shared new game; COOP main menu to host or join v
 showing your partner's view; custom character look; German or English menus.
 
 **Requirements:** Gothic 1 with Othello 4.4.2.1, the GD3D11 renderer, the **same version for all players**. Direct
-connections need **UDP port 9955** open on the host; Steam joins need befriended accounts that own Gothic.
+connections need **UDP port 9955** open on the host; Steam joins need the Steam version of Gothic and befriended
+accounts. The zip includes the required `system\GothicCoopConfig.json`.
 
 **Install:** download the zip from [Releases](https://github.com/corshaegar/Othello-Coop/releases), back up
 `system\GD3D11\Bin\g1_avx2.dll`, extract the zip into the Gothic main folder (the one containing `system`) and
